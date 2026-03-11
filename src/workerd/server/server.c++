@@ -5933,9 +5933,22 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
 
     // Check for CLI override of this socket's address/fd.
     KJ_IF_SOME(override, socketOverrides.find(name)) {
+      auto port = override.receiver->getPort();
       auto obj = kj::refcounted<ProxyRoutingListener>(
           *this, kj::mv(override.receiver),
           globalContext->headerTable, timer, kj::mv(allowedServices));
+
+      // Report the bound port via control-fd (same as the non-override path).
+      KJ_IF_SOME(stream, controlOverride) {
+        auto message = kj::str("{\"event\":\"listen\",\"socket\":\"",
+            name, "\",\"port\":", port, "}\n");
+        try {
+          stream->write(message.asBytes());
+        } catch (kj::Exception& e) {
+          KJ_LOG(ERROR, e);
+        }
+      }
+
       tasks.add(obj->run().attach(kj::mv(obj)).exclusiveJoin(forkedDrainWhen.addBranch()));
       socketOverrides.erase(name);
     } else {

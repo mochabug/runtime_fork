@@ -7,10 +7,75 @@ import childProcess from "node:child_process";
 import events from "node:events";
 import { readFileSync, readdirSync } from "node:fs";
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import ts from "typescript";
 import { SourcesMap, createMemoryProgram } from "../src/program";
 import { getFilePath } from "../src/utils";
+
+// Build a PROXY v2 header with a worker ID TLV (type 0xE0).
+// Format: signature(12) + ver/cmd(1) + fam(1) + len(2) + TLV(3 + workerId.length)
+function buildProxyV2Header(workerId: string): Buffer {
+  const workerIdBuf = Buffer.from(workerId);
+  const payloadLen = 3 + workerIdBuf.length;
+  const header = Buffer.alloc(16 + payloadLen);
+  // PROXY v2 signature
+  Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]).copy(header, 0);
+  header[12] = 0x20;  // v2, LOCAL command
+  header[13] = 0x00;  // AF_UNSPEC
+  header.writeUInt16BE(payloadLen, 14);
+  header[16] = 0xe0;  // PP2_TYPE_WORKER_ID
+  header.writeUInt16BE(workerIdBuf.length, 17);
+  workerIdBuf.copy(header, 19);
+  return header;
+}
+
+// fetch() replacement that sends a PROXY v2 header before the HTTP request.
+// Uses a raw TCP connection with manual HTTP/1.1 formatting.
+async function proxyV2Fetch(url: string | URL, workerId: string): Promise<Response> {
+  const parsed = new URL(url);
+  const socket = net.connect(parseInt(parsed.port), parsed.hostname!);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+
+  // Send PROXY v2 header followed by the HTTP request.
+  socket.write(buildProxyV2Header(workerId));
+  socket.write(`GET ${parsed.pathname}${parsed.search} HTTP/1.1\r\nHost: ${parsed.host}\r\nConnection: close\r\n\r\n`);
+
+  // Read the full response as raw bytes.
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.on("end", resolve);
+    socket.on("error", reject);
+  });
+  const raw = Buffer.concat(chunks);
+
+  // Find end of HTTP headers (search in buffer for \r\n\r\n).
+  const separator = Buffer.from("\r\n\r\n");
+  const headerEnd = raw.indexOf(separator);
+  if (headerEnd < 0) {
+    throw new Error("Invalid HTTP response: no header terminator found");
+  }
+
+  const headerSection = raw.subarray(0, headerEnd).toString();
+  const body = raw.subarray(headerEnd + 4);
+  const [statusLine, ...headerLines] = headerSection.split("\r\n");
+  const statusMatch = statusLine.match(/HTTP\/\d+\.\d+\s+(\d+)/);
+  const statusCode = statusMatch ? parseInt(statusMatch[1]) : 500;
+
+  const headers = new Headers();
+  for (const line of headerLines) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx > 0) {
+      headers.append(line.substring(0, colonIdx).trim(), line.substring(colonIdx + 1).trim());
+    }
+  }
+
+  return new Response(body, { status: statusCode, headers });
+}
 
 const OUTPUT_PATH = getFilePath("types/definitions");
 const ENTRYPOINTS = [
@@ -140,7 +205,7 @@ async function buildEntrypoint(
   workerUrl: URL
 ): Promise<{ name: string; files: Array<{ fileName: string; content: string }> }> {
   const url = new URL(`/${entrypoint.compatDate}.bundle`, workerUrl);
-  const response = await fetch(url);
+  const response = await proxyV2Fetch(url, "main");
   if (!response.ok) throw new Error(await response.text());
   const bundle = await response.formData();
 

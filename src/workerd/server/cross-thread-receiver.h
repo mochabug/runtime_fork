@@ -46,7 +46,7 @@ private:
 // Worker threads own instances of this; the main thread pushes fds via pushConnection().
 class CrossThreadConnectionReceiver final: public kj::ConnectionReceiver {
 public:
-  explicit CrossThreadConnectionReceiver(kj::LowLevelAsyncIoProvider& lowLevel);
+  explicit CrossThreadConnectionReceiver(kj::LowLevelAsyncIoProvider& lowLevel, uint port = 0);
 
   // Thread-safe. Called from dispatcher thread.
   void pushConnection(int fd, kj::Array<kj::byte> preamble);
@@ -54,11 +54,12 @@ public:
   // ConnectionReceiver interface — called on the owning worker thread.
   kj::Promise<kj::Own<kj::AsyncIoStream>> accept() override;
   uint getPort() override {
-    return 0;
+    return port_;
   }
 
 private:
   kj::LowLevelAsyncIoProvider& lowLevel;
+  uint port_;
   struct PendingConn {
     int fd;
     kj::Array<kj::byte> preamble;

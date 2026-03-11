@@ -88,8 +88,8 @@ kj::Maybe<int> PrependedAsyncIoStream::getFd() const {
 // CrossThreadConnectionReceiver
 
 CrossThreadConnectionReceiver::CrossThreadConnectionReceiver(
-    kj::LowLevelAsyncIoProvider& lowLevel)
-    : lowLevel(lowLevel) {}
+    kj::LowLevelAsyncIoProvider& lowLevel, uint port)
+    : lowLevel(lowLevel), port_(port) {}
 
 void CrossThreadConnectionReceiver::pushConnection(int fd, kj::Array<kj::byte> preamble) {
   queue.lockExclusive()->add(PendingConn{fd, kj::mv(preamble)});

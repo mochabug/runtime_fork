@@ -28,6 +28,8 @@
 #include <sys/stat.h>
 #endif
 #include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
 
 #include <capnp/dynamic.h>
 #include <capnp/message.h>
@@ -879,6 +881,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             "Useful for development, but not recommended in production.")
         .addOption({"experimental"},
             [this]() {
+      experimentalEnabled = true;
       server->allowExperimental();
       return true;
     },
@@ -1108,12 +1111,14 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 #endif
 
   void enableInspector(kj::StringPtr param) {
+    inspectorAddr = kj::str(param);
     server->enableInspector(kj::str(param));
   }
 
   void enableControl(kj::StringPtr param) {
     int fd = KJ_UNWRAP_OR(param.tryParseAs<uint>(),
         CLI_ERROR("Output value must be a file descriptor (non-negative integer)."));
+    controlFd = fd;
     server->enableControl(fd);
   }
 
@@ -1524,15 +1529,28 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       KJ_SYSCALL(fcntl(cliListenFds[s], F_SETFL, flags | O_NONBLOCK));
     }
 
-    // Create listen fds from config sockets.
+    // Create listen fds from config sockets and extract bound ports.
     auto configSockets = config.getSockets();
     auto configListenFds = kj::heapArray<int>(configSockets.size());
+    auto configPorts = kj::heapArray<uint16_t>(configSockets.size());
     kj::Vector<kj::String> configSocketNames(configSockets.size());
     for (uint s = 0; s < configSockets.size(); s++) {
       configListenFds[s] = createListenSocket(configSockets[s].getAddress(), 80);
       int flags = fcntl(configListenFds[s], F_GETFL);
       KJ_SYSCALL(fcntl(configListenFds[s], F_SETFL, flags | O_NONBLOCK));
       configSocketNames.add(kj::str(configSockets[s].getName()));
+
+      // Extract bound port for passing to worker thread receivers.
+      struct sockaddr_storage addr;
+      socklen_t addrLen = sizeof(addr);
+      KJ_SYSCALL(getsockname(configListenFds[s],
+          reinterpret_cast<struct sockaddr*>(&addr), &addrLen));
+      configPorts[s] = 0;
+      if (addr.ss_family == AF_INET) {
+        configPorts[s] = ntohs(reinterpret_cast<struct sockaddr_in*>(&addr)->sin_port);
+      } else if (addr.ss_family == AF_INET6) {
+        configPorts[s] = ntohs(reinterpret_cast<struct sockaddr_in6*>(&addr)->sin6_port);
+      }
     }
 
     // Total listen fds = CLI + config.
@@ -1567,7 +1585,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     auto threads = kj::heapArray<kj::Own<kj::Thread>>(coreCount);
     for (uint t = 0; t < coreCount; t++) {
       threads[t] = kj::heap<kj::Thread>([this, t, numListenFds, numCliFds, &configSocketNames,
-          &v8System, &config, &drainFulfillers, &initBarrier]() {
+          &configPorts, &v8System, &config, &drainFulfillers, &initBarrier]() {
 #ifdef __linux__
         // Pin thread to CPU.
         int nprocs = sysconf(_SC_NPROCESSORS_ONLN);
@@ -1609,13 +1627,29 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
               kj::str(kj::StringPtr(arg).slice(equalPos + 1)));
         }
 
+        // Forward settings to thread servers.
+        if (experimentalEnabled) {
+          threadServer->allowExperimental();
+        }
+
+        // Forward inspector and control-fd to thread 0 only.
+        if (t == 0) {
+          KJ_IF_SOME(addr, inspectorAddr) {
+            threadServer->enableInspector(kj::str(addr));
+          }
+          KJ_IF_SOME(fd, controlFd) {
+            threadServer->enableControl(fd);
+          }
+        }
+
         // Create CrossThreadConnectionReceiver per listen fd and publish pointers.
         auto receivers =
             kj::heapArray<kj::Own<CrossThreadConnectionReceiver>>(numListenFds);
         auto receiverPtrs = kj::heapArray<CrossThreadConnectionReceiver*>(numListenFds);
         for (uint s = 0; s < numListenFds; s++) {
+          uint port = (s >= numCliFds) ? configPorts[s - numCliFds] : 0;
           receivers[s] =
-              kj::heap<CrossThreadConnectionReceiver>(*threadIo.lowLevelProvider);
+              kj::heap<CrossThreadConnectionReceiver>(*threadIo.lowLevelProvider, port);
           receiverPtrs[s] = receivers[s].get();
           // Give a non-owning reference to the Server; receiver lifetime is managed by this
           // thread's scope (outlives Server).
@@ -1688,23 +1722,25 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
               KJ_FAIL_SYSCALL("accept", errno);
             }
 
-            // Set non-blocking immediately (required for async FdObserver).
+            // Set non-blocking (required for worker thread's async I/O).
             {
               int flags = fcntl(connFd, F_GETFL);
               KJ_SYSCALL(fcntl(connFd, F_SETFL, flags | O_NONBLOCK));
             }
 
-            // Spawn an async task for PROXY v2 parsing on this connection.
-            // This avoids blocking the main event loop.
-            tasks.add([&, connFd, s]() -> kj::Promise<void> {
-              kj::UnixEventPort::FdObserver connObserver(
-                  io.unixEventPort, connFd, kj::UnixEventPort::FdObserver::OBSERVE_READ);
-              co_await connObserver.whenBecomesReadable();
-
+            // Parse PROXY v2 header synchronously with poll(). The header is
+            // tiny (< 30 bytes) and clients send it immediately after connecting,
+            // so poll() returns instantly in normal operation.
+            {
+              struct pollfd pfd = {connFd, POLLIN, 0};
+              if (poll(&pfd, 1, 1000) <= 0) {
+                close(connFd);
+                continue;
+              }
               auto result = parseProxyV2Header(connFd);
               if (!result.success) {
                 close(connFd);
-                co_return;
+                continue;
               }
 
               KJ_IF_SOME(workerId, result.workerId) {
@@ -1714,11 +1750,10 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
                 }
                 allReceivers[targetCore][s]->pushConnection(connFd, kj::mv(result.preamble));
               } else {
-                // No worker ID in PROXY v2 header — close connection.
                 close(connFd);
-                co_return;
+                continue;
               }
-            }());
+            }
           }
         }
       }());
@@ -1829,6 +1864,9 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   bool predictable = false;
   bool allAutogates = false;
   uint coreCount = 1;
+  bool experimentalEnabled = false;
+  kj::Maybe<int> controlFd;
+  kj::Maybe<kj::String> inspectorAddr;
   kj::Maybe<kj::String> testCompatDate;
   kj::Maybe<FileWatcher> watcher;
 

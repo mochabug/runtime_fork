@@ -1,8 +1,54 @@
 import { env } from 'node:process';
 import { beforeEach, afterEach, test } from 'node:test';
 import assert from 'node:assert';
+import net from 'node:net';
 import CDP from 'chrome-remote-interface';
 import { WorkerdServerHarness } from '../server-harness.mjs';
+
+// Build a PROXY v2 header with a worker ID TLV (type 0xE0).
+function buildProxyV2Header(workerId) {
+  const workerIdBuf = Buffer.from(workerId);
+  const payloadLen = 3 + workerIdBuf.length;
+  const header = Buffer.alloc(16 + payloadLen);
+  Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]).copy(header, 0);
+  header[12] = 0x20;  // v2, LOCAL command
+  header[13] = 0x00;  // AF_UNSPEC
+  header.writeUInt16BE(payloadLen, 14);
+  header[16] = 0xe0;  // PP2_TYPE_WORKER_ID
+  header.writeUInt16BE(workerIdBuf.length, 17);
+  workerIdBuf.copy(header, 19);
+  return header;
+}
+
+// fetch() replacement that sends a PROXY v2 header before the HTTP request.
+async function proxyV2Fetch(url, workerId) {
+  const parsed = new URL(url);
+  const socket = net.connect(parseInt(parsed.port), parsed.hostname);
+  await new Promise((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+
+  socket.write(buildProxyV2Header(workerId));
+  socket.write(`GET ${parsed.pathname}${parsed.search} HTTP/1.1\r\nHost: ${parsed.host}\r\nConnection: close\r\n\r\n`);
+
+  const chunks = [];
+  await new Promise((resolve, reject) => {
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.on('end', resolve);
+    socket.on('error', reject);
+  });
+  const raw = Buffer.concat(chunks);
+  // Find end of HTTP headers
+  const headerEndIdx = raw.indexOf('\r\n\r\n');
+  const body = raw.subarray(headerEndIdx + 4);
+
+  return {
+    ok: true,
+    status: 200,
+    arrayBuffer: () => Promise.resolve(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)),
+  };
+}
 
 // Global that is reset for each test.
 let workerd;
@@ -61,7 +107,7 @@ async function profileAndExpectDeriveBitsFrames(inspectorClient) {
 
   // Drive the worker with a test request. A single one is sufficient.
   let httpPort = await workerd.getListenPort('http');
-  const response = await fetch(`http://localhost:${httpPort}`);
+  const response = await proxyV2Fetch(`http://localhost:${httpPort}`, 'main');
   await response.arrayBuffer();
 
   // Stop and disable profiling.

@@ -6,13 +6,13 @@ sh_test(
     srcs = ["compile-test.sh"],
     args = [
         "$(location //src/workerd/server:workerd)",
-        "$(location //samples:helloworld/config.capnp)",
+        "$(location compile-test-config.capnp)",
         "$(location compile-helloworld-test.ok)",
     ],
     data = [
         "compile-helloworld-test.ok",
-        "//samples:helloworld/config.capnp",
-        "//samples:helloworld/worker.js",
+        "compile-test-config.capnp",
+        "worker.js",
         "//src/workerd/server:workerd",
     ],
     tags = ["no-qemu"],

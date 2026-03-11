@@ -8,7 +8,53 @@ This test now covers both FinalizationRegistry and WeakRef APIs.
 import { env } from 'node:process';
 import { beforeEach, afterEach, test, after } from 'node:test';
 import assert from 'node:assert';
+import net from 'node:net';
 import { WorkerdServerHarness } from '../server-harness.mjs';
+
+// Build a PROXY v2 header with a worker ID TLV (type 0xE0).
+function buildProxyV2Header(workerId) {
+  const workerIdBuf = Buffer.from(workerId);
+  const payloadLen = 3 + workerIdBuf.length;
+  const header = Buffer.alloc(16 + payloadLen);
+  Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]).copy(header, 0);
+  header[12] = 0x20;
+  header[13] = 0x00;
+  header.writeUInt16BE(payloadLen, 14);
+  header[16] = 0xe0;
+  header.writeUInt16BE(workerIdBuf.length, 17);
+  workerIdBuf.copy(header, 19);
+  return header;
+}
+
+// fetch() replacement that sends a PROXY v2 header before the HTTP request.
+async function proxyV2Fetch(url, workerId) {
+  const parsed = new URL(url);
+  const socket = net.connect(parseInt(parsed.port), parsed.hostname);
+  await new Promise((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+
+  socket.write(buildProxyV2Header(workerId));
+  socket.write(`GET ${parsed.pathname}${parsed.search} HTTP/1.1\r\nHost: ${parsed.host}\r\nConnection: close\r\n\r\n`);
+
+  const chunks = [];
+  await new Promise((resolve, reject) => {
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.on('end', resolve);
+    socket.on('error', reject);
+  });
+  const raw = Buffer.concat(chunks);
+  const headerEndIdx = raw.indexOf('\r\n\r\n');
+  const body = raw.subarray(headerEndIdx + 4).toString();
+
+  return {
+    ok: true,
+    status: 200,
+    text: () => Promise.resolve(body),
+    json: () => Promise.resolve(JSON.parse(body)),
+  };
+}
 
 // Global that is reset for each test.
 let workerd;
@@ -68,7 +114,7 @@ test('JS FinalizationRegistry', async () => {
 
   // The first request doesn't do any I/O so we won't notice the effects
   // of FinalizationRegistry cleanup callbacks as part of the response
-  const response = await fetch(`http://localhost:${httpPort}?test=fr`);
+  const response = await proxyV2Fetch(`http://localhost:${httpPort}?test=fr`, 'main');
   console.log('[TEST] First FR request completed');
   assert.strictEqual(await response.text(), '0');
 
@@ -76,7 +122,7 @@ test('JS FinalizationRegistry', async () => {
   // the effects of FinalizationRegistry cleanup callbacks
   for (let i = 0; i < 2; ++i) {
     console.log(`[TEST] FR request ${i + 2} starting...`);
-    const response = await fetch(`http://localhost:${httpPort}?test=fr`);
+    const response = await proxyV2Fetch(`http://localhost:${httpPort}?test=fr`, 'main');
     console.log(`[TEST] FR request ${i + 2} completed`);
     assert.strictEqual(await response.text(), `${i + 2}`);
   }
@@ -88,8 +134,8 @@ test('JS WeakRef', async () => {
 
   // Create a new object and a WeakRef to it
   console.log('[TEST] Creating WeakRef object...');
-  let response = await fetch(
-    `http://localhost:${httpPort}?test=weakref&create`
+  let response = await proxyV2Fetch(
+    `http://localhost:${httpPort}?test=weakref&create`, 'main'
   );
   let data = await response.json();
   console.log('[TEST] WeakRef object created:', data);
@@ -100,7 +146,7 @@ test('JS WeakRef', async () => {
 
   // Check that the WeakRef is still valid
   console.log('[TEST] Checking WeakRef validity...');
-  response = await fetch(`http://localhost:${httpPort}?test=weakref`);
+  response = await proxyV2Fetch(`http://localhost:${httpPort}?test=weakref`, 'main');
   data = await response.json();
   console.log('[TEST] WeakRef validity check result:', data);
   assert.strictEqual(data.isDereferenced, false);
@@ -108,7 +154,7 @@ test('JS WeakRef', async () => {
 
   // Force garbage collection and check if the WeakRef is dereferenced
   console.log('[TEST] Forcing garbage collection...');
-  response = await fetch(`http://localhost:${httpPort}?test=weakref&gc`);
+  response = await proxyV2Fetch(`http://localhost:${httpPort}?test=weakref&gc`, 'main');
   data = await response.json();
   console.log('[TEST] GC result:', data);
   // Check if the reference is gone after GC
@@ -117,7 +163,7 @@ test('JS WeakRef', async () => {
 
   // Create a new object again to verify WeakRef can be reset
   console.log('[TEST] Creating new WeakRef object after GC...');
-  response = await fetch(`http://localhost:${httpPort}?test=weakref&create`);
+  response = await proxyV2Fetch(`http://localhost:${httpPort}?test=weakref&create`, 'main');
   data = await response.json();
   console.log('[TEST] New WeakRef object created:', data);
 
