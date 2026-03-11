@@ -51,11 +51,15 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
     experimental = true;
   }
 
-  void overrideSocket(kj::String name, kj::Own<kj::ConnectionReceiver> port) {
-    socketOverrides.upsert(kj::mv(name), kj::mv(port));
-  }
-  void overrideSocket(kj::String name, kj::String addr) {
-    socketOverrides.upsert(kj::mv(name), kj::mv(addr));
+  struct SocketOverride {
+    kj::Own<kj::ConnectionReceiver> receiver;
+  };
+
+  void overrideSocket(kj::String name, kj::Own<kj::ConnectionReceiver> receiver) {
+    socketOverrides.upsert(kj::mv(name), SocketOverride{kj::mv(receiver)},
+        [](SocketOverride& existing, SocketOverride&& replacement) {
+      existing = kj::mv(replacement);
+    });
   }
   void overrideDirectory(kj::String name, kj::String path) {
     directoryOverrides.upsert(kj::mv(name), kj::mv(path));
@@ -159,7 +163,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
 
   ChannelTokenHandler channelTokenHandler;
 
-  kj::HashMap<kj::String, kj::OneOf<kj::String, kj::Own<kj::ConnectionReceiver>>> socketOverrides;
+  kj::HashMap<kj::String, SocketOverride> socketOverrides;
   kj::HashMap<kj::String, kj::String> directoryOverrides;
 
   // Overrides from the command line.
@@ -302,6 +306,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class WorkerEntrypointService;
   class WorkerdBootstrapImpl;
   class HttpListener;
+  class ProxyRoutingListener;
   class DebugPortListener;
 
   struct ErrorReporter;

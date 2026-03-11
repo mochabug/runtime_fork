@@ -21,9 +21,7 @@ const config :Workerd.Config = (
     # a `writable` option which enables PUT requests.)
     (name = "site-files", disk = "content-dir"),
   ],
-
-  # We export it via HTTP on port 8080.
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "site-worker" ) ],
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["site-worker"] ) ],
 );
 
 # For legibility we define the Worker's config as a separate constant.

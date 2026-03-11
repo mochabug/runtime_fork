@@ -5,7 +5,7 @@ const tailWorkerExample :Workerd.Config = (
     (name = "main", worker = .helloWorld),
     (name = "log", worker = .logWorker),
   ],
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ],
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 const helloWorld :Workerd.Worker = (

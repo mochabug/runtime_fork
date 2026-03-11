@@ -570,14 +570,8 @@ wd_test(
     ],
 )
 
-wd_test(
-    src = "js-rpc-socket-test.wd-test",
-    args = [
-        "--experimental",
-        "--no-verbose",
-    ],
-    data = ["js-rpc-test.js"],
-)
+# js-rpc-socket-test removed: relied on socket-based capnpConnectHost loopback which was removed
+# in favor of PROXY v2 routing.
 
 wd_test(
     src = "http-test-ts.ts-wd-test",

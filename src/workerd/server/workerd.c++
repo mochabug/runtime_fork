@@ -2,6 +2,8 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+#include "cross-thread-receiver.h"
+#include "proxy-protocol.h"
 #include "server.h"
 
 #include <workerd/api/unsafe.h>
@@ -21,9 +23,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #ifdef __linux__
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #endif
+#include <netdb.h>
 
 #include <capnp/dynamic.h>
 #include <capnp/message.h>
@@ -34,6 +38,7 @@
 #include <kj/filesystem.h>
 #include <kj/main.h>
 #include <kj/map.h>
+#include <kj/thread.h>
 
 #if _WIN32
 #include <windows.h>
@@ -132,6 +137,70 @@ class EntropySourceImpl: public kj::EntropySource {
     getEntropy(buffer);
   }
 };
+
+// =======================================================================================
+// Helper for multi-core mode: creates a listening socket for the dispatcher.
+
+#if !_WIN32
+int createListenSocket(kj::StringPtr addrStr, uint defaultPort) {
+  // Parse the address string into host and port components.
+  // Supported formats: "*:port", "host:port", "[ipv6]:port", "host" (uses defaultPort)
+  kj::String hostStr;
+  kj::String portStr;
+
+  if (addrStr.startsWith("*")) {
+    // Wildcard host
+    hostStr = nullptr;
+    if (addrStr.size() > 1 && addrStr[1] == ':') {
+      portStr = kj::str(addrStr.slice(2));
+    } else {
+      portStr = kj::str(defaultPort);
+    }
+  } else if (addrStr.startsWith("[")) {
+    // IPv6 bracket notation: [host]:port
+    auto closeBracket = KJ_ASSERT_NONNULL(addrStr.findFirst(']'),
+        "Invalid IPv6 address format, missing ']'");
+    hostStr = kj::str(addrStr.slice(1, closeBracket));
+    if (closeBracket + 1 < addrStr.size() && addrStr[closeBracket + 1] == ':') {
+      portStr = kj::str(addrStr.slice(closeBracket + 2));
+    } else {
+      portStr = kj::str(defaultPort);
+    }
+  } else {
+    // host:port or just host
+    KJ_IF_SOME(colonPos, addrStr.findLast(':')) {
+      hostStr = kj::str(addrStr.first(colonPos));
+      portStr = kj::str(addrStr.slice(colonPos + 1));
+    } else {
+      hostStr = kj::str(addrStr);
+      portStr = kj::str(defaultPort);
+    }
+  }
+
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+
+  const char* hostCStr = (hostStr == nullptr || hostStr.size() == 0) ? nullptr : hostStr.cStr();
+  struct addrinfo* res = nullptr;
+  int gaierr = getaddrinfo(hostCStr, portStr.cStr(), &hints, &res);
+  KJ_REQUIRE(gaierr == 0, "getaddrinfo failed", addrStr, gai_strerror(gaierr));
+  KJ_DEFER(freeaddrinfo(res));
+
+  int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  KJ_SYSCALL(fd, "socket");
+
+  int optval = 1;
+  KJ_SYSCALL(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)));
+
+  KJ_SYSCALL(bind(fd, res->ai_addr, res->ai_addrlen), "bind", addrStr);
+  KJ_SYSCALL(listen(fd, SOMAXCONN), "listen", addrStr);
+
+  return fd;
+}
+#endif
 
 // =======================================================================================
 // Some generic CLI helpers so that we can throw exceptions rather than return
@@ -837,14 +906,14 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             "Set the snapshot snapshot directory.");
   }
 
+  void addListenAddress(kj::StringPtr addr) {
+    listenAddresses.add(kj::str(addr));
+  }
+
   kj::MainFunc addServeOptions(kj::MainBuilder& builder) {
     return addServeOrTestOptions(builder)
-        .addOptionWithArg({'s', "socket-addr"}, CLI_METHOD(overrideSocketAddr), "<name>=<addr>",
-            "Override the socket named <name> to bind to the address <addr> instead "
-            "of the address specified in the config file.")
-        .addOptionWithArg({'S', "socket-fd"}, CLI_METHOD(overrideSocketFd), "<name>=<fd>",
-            "Override the socket named <name> to listen on the already-open socket "
-            "descriptor <fd> instead of the address specified in the config file.")
+        .addOptionWithArg({'l', "listen"}, CLI_METHOD(addListenAddress), "<addr>",
+            "Listen for HTTP connections on <addr>. Can be specified multiple times.")
         .addOptionWithArg({"control-fd"}, CLI_METHOD(enableControl), "<fd>",
             "Enable sending of control messages on descriptor <fd>. Currently this "
             "only reports the port each socket is listening on when ready.")
@@ -852,6 +921,11 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             "Listen on the specified address for debug RPC connections. This exposes "
             "a privileged interface that allows access to all services in the process. "
             "For use by miniflare and local development only.")
+#if !_WIN32
+        .addOptionWithArg({'c', "cores"}, CLI_METHOD(setCoreCount), "<N>",
+            "Run N worker cores with a PROXY v2 dispatcher. Each core gets its own "
+            "event loop and V8 isolates. On Linux, cores are pinned to CPUs. Default: 1.")
+#endif
         .callAfterParsing(CLI_METHOD(serve))
         .build();
   }
@@ -1013,75 +1087,14 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     return {kj::str(str.first(equalPos)), str.slice(equalPos + 1)};
   }
 
-  void overrideSocketAddr(kj::StringPtr param) {
-    auto [name, value] = parseOverride(param);
-    server->overrideSocket(kj::mv(name), kj::str(value));
-  }
-
-#if _WIN32
-  void validateSocketFd(uint fd, kj::StringPtr label) {
-    int acceptcon = 0;
-    int optlen = sizeof(acceptcon);
-    int result = getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, (char*)&acceptcon, &optlen);
-    if (result == SOCKET_ERROR) {
-      // https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-getsockopt#return-value
-      switch (int error = WSAGetLastError()) {
-        case WSAENOTSOCK:
-          CLI_ERROR("File descriptor is not a socket.");
-        case WSAENOPROTOOPT:
-          // Some operating systems don't support SO_ACCEPTCONN; in that case just move on and
-          // assume it is listening.
-          break;
-        default:
-          KJ_FAIL_SYSCALL("getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN)", error);
-      }
-    } else if (!acceptcon) {
-      CLI_ERROR("Socket for ", label, " is not listening.");
-    }
-  }
-#else
-  void validateSocketFd(uint fd, kj::StringPtr label) {
-    int acceptcon = 0;
-    socklen_t optlen = sizeof(acceptcon);
-    KJ_SYSCALL_HANDLE_ERRORS(getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &acceptcon, &optlen)) {
-      case EBADF:
-        CLI_ERROR("File descriptor is not open.");
-      case ENOTSOCK:
-        CLI_ERROR("File descriptor is not a socket.");
-      case ENOPROTOOPT:
-        // Some operating systems don't support SO_ACCEPTCONN; in that case just move on and
-        // assume it is listening.
-        break;
-      default:
-        KJ_FAIL_SYSCALL("getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN)", error);
-    }
-    else {
-      if (!acceptcon) {
-        CLI_ERROR("Socket for ", label, " is not listening.");
-      }
-    }
-  }
-#endif
-
-  void overrideSocketFd(kj::StringPtr param) {
-    auto [name, value] = parseOverride(param);
-
-    int fd = KJ_UNWRAP_OR(value.tryParseAs<uint>(),
-        CLI_ERROR("Socket value must be a file descriptor (non-negative integer)."));
-
-    validateSocketFd(fd, name);
-
-    inheritedFds.add(fd);
-    server->overrideSocket(kj::mv(name),
-        io.lowLevelProvider->wrapListenSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP));
-  }
-
   void overrideDirectory(kj::StringPtr param) {
+    directoryOverrideArgs.add(kj::str(param));
     auto [name, value] = parseOverride(param);
     server->overrideDirectory(kj::mv(name), kj::str(value));
   }
 
   void overrideExternal(kj::StringPtr param) {
+    externalOverrideArgs.add(kj::str(param));
     auto [name, value] = parseOverride(param);
     server->overrideExternal(kj::mv(name), kj::str(value));
   }
@@ -1106,6 +1119,12 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
   void enableDebugPort(kj::StringPtr param) {
     server->enableDebugPort(kj::str(param));
+  }
+
+  void setCoreCount(kj::StringPtr param) {
+    coreCount = KJ_UNWRAP_OR(param.tryParseAs<uint>(),
+        CLI_ERROR("Core count must be a positive integer."));
+    if (coreCount == 0) coreCount = 1;
   }
 
   void setPackageDiskCacheDir(kj::StringPtr pathStr) {
@@ -1456,15 +1475,277 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   }
 
   void serve() noexcept {
-    serveImpl([&](jsg::V8System& v8System, config::Config::Reader config) {
-#if _WIN32
-      return server->run(v8System, config);
-#else
-      return server->run(v8System, config,
-          // Gracefully drain when SIGTERM is received.
-          io.unixEventPort.onSignal(SIGTERM).ignoreResult());
+    if (hadErrors) {
+      KJ_IF_SOME(w, watcher) {
+        context.warning(
+            "Can't start server due to config errors, waiting for config files to change...");
+        waitForChanges(w).wait(io.waitScope);
+        reloadFromConfigChange();
+      } else {
+        context.exit();
+      }
+      return;
+    }
+
+    auto config = getConfig();
+
+    if (config.hasLogging() ? config.getLogging().getStructuredLogging()
+                            : config.getStructuredLogging()) {
+      context.enableStructuredLogging();
+    }
+
+    // V8 platform and system are process-wide singletons, created once and shared (read-only).
+    auto platform = jsg::defaultPlatform(0);
+    WorkerdPlatform v8Platform(*platform);
+    jsg::V8System v8System(v8Platform,
+        KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
+
+    // Require at least one listen source (--listen flag or config socket).
+    bool hasConfigSockets = config.hasSockets() && config.getSockets().size() > 0;
+    KJ_REQUIRE(listenAddresses.size() > 0 || hasConfigSockets,
+        "At least one --listen address or config socket is required.");
+
+    // Build serviceToCore map: round-robin assign worker services to cores.
+    kj::HashMap<kj::String, uint> serviceToCore;
+    uint nextCore = 0;
+    for (auto service: config.getServices()) {
+      if (service.isWorker()) {
+        serviceToCore.upsert(
+            kj::str(service.getName()), nextCore % coreCount, [](uint&, uint&&) {});
+        nextCore++;
+      }
+    }
+
+    // Create listen fds from CLI --listen addresses.
+    auto cliListenFds = kj::heapArray<int>(listenAddresses.size());
+    for (uint s = 0; s < listenAddresses.size(); s++) {
+      cliListenFds[s] = createListenSocket(listenAddresses[s], 80);
+      int flags = fcntl(cliListenFds[s], F_GETFL);
+      KJ_SYSCALL(fcntl(cliListenFds[s], F_SETFL, flags | O_NONBLOCK));
+    }
+
+    // Create listen fds from config sockets.
+    auto configSockets = config.getSockets();
+    auto configListenFds = kj::heapArray<int>(configSockets.size());
+    kj::Vector<kj::String> configSocketNames(configSockets.size());
+    for (uint s = 0; s < configSockets.size(); s++) {
+      configListenFds[s] = createListenSocket(configSockets[s].getAddress(), 80);
+      int flags = fcntl(configListenFds[s], F_GETFL);
+      KJ_SYSCALL(fcntl(configListenFds[s], F_SETFL, flags | O_NONBLOCK));
+      configSocketNames.add(kj::str(configSockets[s].getName()));
+    }
+
+    // Total listen fds = CLI + config.
+    uint numCliFds = listenAddresses.size();
+    uint numConfigFds = configSockets.size();
+    uint numListenFds = numCliFds + numConfigFds;
+    auto listenFds = kj::heapArray<int>(numListenFds);
+    for (uint s = 0; s < numCliFds; s++) {
+      listenFds[s] = cliListenFds[s];
+    }
+    for (uint s = 0; s < numConfigFds; s++) {
+      listenFds[numCliFds + s] = configListenFds[s];
+    }
+
+    // Create shared drain infrastructure: one fulfiller per core.
+    auto drainFulfillers = kj::heapArray<
+        kj::MutexGuarded<kj::Maybe<kj::Own<kj::CrossThreadPromiseFulfiller<void>>>>>(coreCount);
+    for (auto& f: drainFulfillers) {
+      *f.lockExclusive() = kj::none;
+    }
+
+    // Initialization barrier: worker threads publish their receiver pointers here.
+    auto initBarrier = kj::heapArray<
+        kj::MutexGuarded<kj::Maybe<kj::Array<CrossThreadConnectionReceiver*>>>>(coreCount);
+    for (auto& b: initBarrier) {
+      *b.lockExclusive() = kj::none;
+    }
+
+    KJ_LOG(INFO, "Starting multi-core server with PROXY v2 dispatcher", coreCount);
+
+    // Spawn N worker threads, each with its own complete Server instance.
+    auto threads = kj::heapArray<kj::Own<kj::Thread>>(coreCount);
+    for (uint t = 0; t < coreCount; t++) {
+      threads[t] = kj::heap<kj::Thread>([this, t, numListenFds, numCliFds, &configSocketNames,
+          &v8System, &config, &drainFulfillers, &initBarrier]() {
+#ifdef __linux__
+        // Pin thread to CPU.
+        int nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nprocs > 0) {
+          cpu_set_t cpuset;
+          CPU_ZERO(&cpuset);
+          CPU_SET(t % nprocs, &cpuset);
+          pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        }
 #endif
-    });
+
+        // Each thread gets its own event loop and I/O infrastructure.
+        kj::AsyncIoContext threadIo = kj::setupAsyncIo();
+        auto threadFs = kj::newDiskFilesystem();
+        EntropySourceImpl threadEntropy;
+        NetworkWithLoopback threadNetwork{threadIo.provider->getNetwork(), *threadIo.provider};
+
+        auto threadServer = kj::heap<Server>(*threadFs,
+            threadIo.provider->getTimer(),
+            kj::systemPreciseMonotonicClock(),
+            threadNetwork,
+            threadEntropy,
+            Worker::LoggingOptions(Worker::ConsoleMode::STDOUT),
+            [this](kj::String error) {
+              context.error(error);
+            });
+
+        // Apply forwarded overrides.
+        for (auto& arg: directoryOverrideArgs) {
+          auto equalPos = KJ_ASSERT_NONNULL(kj::StringPtr(arg).findFirst('='));
+          threadServer->overrideDirectory(
+              kj::str(kj::StringPtr(arg).first(equalPos)),
+              kj::str(kj::StringPtr(arg).slice(equalPos + 1)));
+        }
+        for (auto& arg: externalOverrideArgs) {
+          auto equalPos = KJ_ASSERT_NONNULL(kj::StringPtr(arg).findFirst('='));
+          threadServer->overrideExternal(
+              kj::str(kj::StringPtr(arg).first(equalPos)),
+              kj::str(kj::StringPtr(arg).slice(equalPos + 1)));
+        }
+
+        // Create CrossThreadConnectionReceiver per listen fd and publish pointers.
+        auto receivers =
+            kj::heapArray<kj::Own<CrossThreadConnectionReceiver>>(numListenFds);
+        auto receiverPtrs = kj::heapArray<CrossThreadConnectionReceiver*>(numListenFds);
+        for (uint s = 0; s < numListenFds; s++) {
+          receivers[s] =
+              kj::heap<CrossThreadConnectionReceiver>(*threadIo.lowLevelProvider);
+          receiverPtrs[s] = receivers[s].get();
+          // Give a non-owning reference to the Server; receiver lifetime is managed by this
+          // thread's scope (outlives Server).
+          if (s < numCliFds) {
+            // CLI --listen sockets get synthetic names.
+            threadServer->overrideSocket(kj::str("listen-", s),
+                kj::Own<kj::ConnectionReceiver>(receivers[s].get(), kj::NullDisposer::instance));
+          } else {
+            // Config sockets use their config-defined names so listenOnSockets() matches them.
+            threadServer->overrideSocket(kj::str(configSocketNames[s - numCliFds]),
+                kj::Own<kj::ConnectionReceiver>(receivers[s].get(), kj::NullDisposer::instance));
+          }
+        }
+
+        // Publish receiver pointers to main thread.
+        *initBarrier[t].lockExclusive() = kj::mv(receiverPtrs);
+
+        // Set up cross-thread drain signaling.
+        auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
+        *drainFulfillers[t].lockExclusive() = kj::mv(paf.fulfiller);
+
+        // Run the server. This blocks until drain completes.
+        threadServer->run(v8System, config, kj::mv(paf.promise)).wait(threadIo.waitScope);
+      });
+    }
+
+    // Wait for all cores to publish their receiver pointers.
+    auto allReceivers = kj::heapArray<kj::Array<CrossThreadConnectionReceiver*>>(coreCount);
+    for (uint t = 0; t < coreCount; t++) {
+      for (;;) {
+        {
+          auto lock = initBarrier[t].lockExclusive();
+          KJ_IF_SOME(ptrs, *lock) {
+            allReceivers[t] = kj::mv(ptrs);
+            *lock = kj::none;
+            break;
+          }
+        }
+        usleep(1000);
+      }
+    }
+
+    KJ_LOG(INFO, "All cores initialized, dispatcher ready");
+
+    // Main thread dispatcher: accept connections, parse PROXY v2, route to correct core.
+    struct DispatchErrorHandler: kj::TaskSet::ErrorHandler {
+      void taskFailed(kj::Exception&& exception) override {
+        KJ_LOG(ERROR, "Dispatch error", exception);
+      }
+    };
+    DispatchErrorHandler errorHandler;
+    kj::TaskSet tasks(errorHandler);
+
+    uint roundRobin = 0;
+
+    for (uint s = 0; s < numListenFds; s++) {
+      int listenFd = listenFds[s];
+      tasks.add([&, s, listenFd]() -> kj::Promise<void> {
+        kj::UnixEventPort::FdObserver observer(
+            io.unixEventPort, listenFd, kj::UnixEventPort::FdObserver::OBSERVE_READ);
+
+        for (;;) {
+          co_await observer.whenBecomesReadable();
+
+          // Drain all pending connections (edge-triggered: must drain before next wait).
+          for (;;) {
+            int connFd = accept(listenFd, nullptr, nullptr);
+            if (connFd < 0) {
+              if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+              KJ_FAIL_SYSCALL("accept", errno);
+            }
+
+            // Set non-blocking immediately (required for async FdObserver).
+            {
+              int flags = fcntl(connFd, F_GETFL);
+              KJ_SYSCALL(fcntl(connFd, F_SETFL, flags | O_NONBLOCK));
+            }
+
+            // Spawn an async task for PROXY v2 parsing on this connection.
+            // This avoids blocking the main event loop.
+            tasks.add([&, connFd, s]() -> kj::Promise<void> {
+              kj::UnixEventPort::FdObserver connObserver(
+                  io.unixEventPort, connFd, kj::UnixEventPort::FdObserver::OBSERVE_READ);
+              co_await connObserver.whenBecomesReadable();
+
+              auto result = parseProxyV2Header(connFd);
+              if (!result.success) {
+                close(connFd);
+                co_return;
+              }
+
+              KJ_IF_SOME(workerId, result.workerId) {
+                uint targetCore = roundRobin++ % coreCount;
+                KJ_IF_SOME(core, serviceToCore.find(workerId)) {
+                  targetCore = core;
+                }
+                allReceivers[targetCore][s]->pushConnection(connFd, kj::mv(result.preamble));
+              } else {
+                // No worker ID in PROXY v2 header — close connection.
+                close(connFd);
+                co_return;
+              }
+            }());
+          }
+        }
+      }());
+    }
+
+    // Main thread: wait for SIGTERM while dispatcher coroutines run.
+    io.unixEventPort.onSignal(SIGTERM).wait(io.waitScope);
+    KJ_LOG(INFO, "Received SIGTERM, draining all cores...");
+
+    // Signal all cores to drain.
+    for (uint t = 0; t < coreCount; t++) {
+      auto lock = drainFulfillers[t].lockExclusive();
+      KJ_IF_SOME(fulfiller, *lock) {
+        fulfiller->fulfill();
+        *lock = kj::none;
+      }
+    }
+
+    // Close listen fds so no new connections arrive.
+    for (uint s = 0; s < listenFds.size(); s++) {
+      close(listenFds[s]);
+    }
+
+    // Join all threads (kj::Thread destructor waits for thread completion).
+    threads = nullptr;
+
+    context.exit();
   }
 
   void test() {
@@ -1518,11 +1799,6 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     // Write extra spaces to fully overwrite the line that we wrote earlier with a CR but no LF:
     //     "Noticed configuration change, reloading shortly...\r"
     context.warning("Reloading due to config change...                                      ");
-    for (auto fd: inheritedFds) {
-      // Disable close-on-exec for inherited FDs so that the successor process can also inherit
-      // them.
-      KJ_SYSCALL(ioctl(fd, FIONCLEX));
-    }
     bool missingBinary = false;
     for (;;) {
       KJ_SYSCALL_HANDLE_ERRORS(execve(KJ_ASSERT_NONNULL(exeInfo).path.cStr(), argv, environ)) {
@@ -1552,8 +1828,15 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   bool noVerbose = false;
   bool predictable = false;
   bool allAutogates = false;
+  uint coreCount = 1;
   kj::Maybe<kj::String> testCompatDate;
   kj::Maybe<FileWatcher> watcher;
+
+  kj::Vector<kj::String> listenAddresses;
+
+  // Raw override args stored for forwarding to per-thread Server instances in multi-threaded mode.
+  kj::Vector<kj::String> directoryOverrideArgs;
+  kj::Vector<kj::String> externalOverrideArgs;
 
   kj::Own<kj::Filesystem> fs = kj::newDiskFilesystem();
   kj::AsyncIoContext io = kj::setupAsyncIo();
@@ -1567,8 +1850,6 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
   kj::Own<void> configOwner;  // backing object for `config`, if it's not `schemaParser`.
   kj::Maybe<config::Config::Reader> config;
-
-  kj::Vector<int> inheritedFds;
 
   kj::Maybe<kj::String> testServicePattern;
   kj::Maybe<kj::String> testEntrypointPattern;

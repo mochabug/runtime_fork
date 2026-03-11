@@ -6,7 +6,7 @@ using Workerd = import "/workerd/workerd.capnp";
 
 const webStreamsExample :Workerd.Config = (
   services = [ (name = "main", worker = .webStreams) ],
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 const webStreams :Workerd.Worker = (

@@ -17,8 +17,7 @@ const helloWorldExample :Workerd.Config = (
     (name = "main", worker = .gopherWorker),
     (name = "proxy", external = .localProxy)
   ],
-
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 # The definition of the actual worker exposed using the "main" service.

@@ -6,9 +6,7 @@ const config :Workerd.Config = (
   services = [
     ( name = "main", worker = .worker ),
   ],
-  sockets = [
-    ( name = "http", address = "*:0", http = (), service = "main" ),
-  ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ]
 );
 
 const worker :Workerd.Worker = (

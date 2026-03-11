@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+#include "proxy-protocol.h"
 #include "server.h"
 
 #include <workerd/jsg/jsg-test.h>
@@ -362,6 +363,16 @@ class TestServer final: private kj::Filesystem, private kj::EntropySource, priva
   // Start the server. Call before connect().
   void start(kj::Promise<void> drainWhen = kj::NEVER_DONE) {
     KJ_REQUIRE(runTask == kj::none);
+
+    // Auto-create a socket override with a mock listener so tests can connect.
+    auto pipe = kj::newCapabilityPipe();
+    auto receiver = kj::heap<kj::CapabilityStreamConnectionReceiver>(*pipe.ends[0])
+                        .attach(kj::mv(pipe.ends[0]));
+    auto sender = kj::heap<kj::CapabilityStreamNetworkAddress>(kj::none, *pipe.ends[1])
+                      .attach(kj::mv(pipe.ends[1]));
+    defaultSender = kj::mv(sender);
+    server.overrideSocket(kj::str("default"), kj::mv(receiver));
+
     auto task =
         server.run(v8System, *config, kj::mv(drainWhen)).eagerlyEvaluate([](kj::Exception&& e) {
       KJ_FAIL_EXPECT(e);
@@ -378,16 +389,25 @@ class TestServer final: private kj::Filesystem, private kj::EntropySource, priva
     KJ_EXPECT(expectedErrors == nullptr, "some expected errors weren't seen");
   }
 
-  // Connect to the server on the given address. The string just has to match what is in the
-  // config; the actual connection is in-memory with no network involved.
-  TestStream connect(kj::StringPtr addr) {
-    return TestStream(ws, KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().wait(ws));
+  // Connect to the server, routing to the given service via PROXY v2.
+  TestStream connect(kj::StringPtr serviceName) {
+    auto& sender = KJ_REQUIRE_NONNULL(defaultSender, "must call start() first");
+    auto stream = sender->connect().wait(ws);
+    // Write PROXY v2 header with the service name as worker ID.
+    auto proxyHeader = buildProxyV2Header(serviceName);
+    stream->write(proxyHeader).wait(ws);
+    return TestStream(ws, kj::mv(stream));
   }
 
-  // Try to connect to the address and return whether or not this connection attempt hangs,
-  // i.e. a listener exists but connections are not being accepted.
-  bool connectHangs(kj::StringPtr addr) {
-    return !KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().poll(ws);
+  // Try to connect and return whether or not the connection attempt hangs.
+  bool connectHangs(kj::StringPtr serviceName) {
+    auto& sender = KJ_REQUIRE_NONNULL(defaultSender, "must call start() first");
+    return !sender->connect().poll(ws);
+  }
+
+  // Connect to a raw address (e.g. debug port) without PROXY v2 framing.
+  TestStream connectRaw(kj::StringPtr addr) {
+    return TestStream(ws, KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().wait(ws));
   }
 
   // Expect an incoming connection on the given address and from a network with the given
@@ -463,8 +483,11 @@ class TestServer final: private kj::Filesystem, private kj::EntropySource, priva
   // ---------------------------------------------------------------------------
   // implements Network
 
-  // Addresses that the server is listening on.
+  // Addresses that the server is listening on (used by mock network for subrequests).
   kj::HashMap<kj::String, kj::Own<kj::NetworkAddress>> sockets;
+
+  // Default sender for test connections — created in start(), used by connect().
+  kj::Maybe<kj::Own<kj::NetworkAddress>> defaultSender;
 
   class MockNetwork;
 
@@ -590,12 +613,6 @@ kj::String singleWorker(kj::StringPtr def) {
         worker = )"_kj,
       def, R"(
       )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 }
@@ -611,7 +628,7 @@ KJ_TEST("Server: serve basic Service Worker") {
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   // Send a request, get a response.
   conn.httpGet200("/", "Hello: http://foo/\n");
@@ -652,7 +669,7 @@ KJ_TEST("Server: use service name as Service Worker origin") {
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", R"(
     Error: Doh!
         at hello:2:34)"_blockquote);
@@ -673,7 +690,7 @@ KJ_TEST("Server: serve basic modular Worker") {
     ]
   ))"_kj));
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "Hello: http://foo/");
 }
 
@@ -728,7 +745,7 @@ KJ_TEST("Server: serve modular Worker with imports") {
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/",
       "Hello from foo.js\n"
       "Hello from bar.txt\n"
@@ -761,7 +778,7 @@ KJ_TEST("Server: compatibility dates") {
     TestServer test(selfNavigatorCheckerWorker("compatibilityDate = \"2022-08-17\""));
 
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/", "true");
   }
 
@@ -770,7 +787,7 @@ KJ_TEST("Server: compatibility dates") {
     TestServer test(selfNavigatorCheckerWorker("compatibilityDate = \"2020-01-01\""));
 
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/", "false");
   }
 
@@ -780,7 +797,7 @@ KJ_TEST("Server: compatibility dates") {
         "compatibilityDate = \"2022-08-17\", compatibilityFlags = [\"no_global_navigator\"]"));
 
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/", "false");
   }
 }
@@ -844,7 +861,7 @@ KJ_TEST("Server: value bindings") {
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/",
       "Hello from text binding\n"
       "Hello from data binding\n"
@@ -988,7 +1005,7 @@ KJ_TEST("Server: WebCrypto bindings") {
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/",
       "hmac signature is 4a27693183b28d2616209d6ff5e77646af5fc06ea6affac37415995b07be2ddf\n"
       "hmac verifications: true, false\n"
@@ -1025,7 +1042,7 @@ KJ_TEST("Server: subrequest to default outbound") {
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveInternetSubrequest("subhost");
@@ -1068,17 +1085,11 @@ KJ_TEST("Server: override 'internet' service") {
       ),
       ( name = "internet",
         external = "proxy-host" )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveSubrequest("proxy-host");
@@ -1119,17 +1130,11 @@ KJ_TEST("Server: override globalOutbound") {
       ),
       ( name = "alternate-outbound",
         external = "proxy-host" )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveSubrequest("proxy-host");
@@ -1181,7 +1186,7 @@ KJ_TEST("Server: connect() to default outbound") {
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveInternetSubrequest("subhost:123");
@@ -1239,18 +1244,12 @@ KJ_TEST("Server: connect() with Worker as outbound, no connect_pass_though") {
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   conn.recvHttp200("OK");
@@ -1307,18 +1306,12 @@ KJ_TEST("Server: connect() with Worker as outbound, with connect_pass_though") {
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveInternetSubrequest("subhost:123");
@@ -1387,17 +1380,11 @@ KJ_TEST("Server: capability bindings") {
         address = "hyperdrive-host",
         tcp = ()
       ))
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   {
@@ -1524,21 +1511,17 @@ KJ_TEST("Server: cyclic bindings") {
           bindings = [(name = "service1", service = "service1")]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "service1"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("service1");
   conn.httpGet200("/", "Hello World!");
 }
 
 KJ_TEST("Server: named entrypoints") {
+  // Named entrypoints are accessible via bindings, not via socket routing.
+  // With PROXY v2 routing, all connections to a service go to its default entrypoint.
   TestServer test(R"((
     services = [
       ( name = "hello",
@@ -1562,48 +1545,17 @@ KJ_TEST("Server: named entrypoints") {
                 `    return new Response("hello from bar entrypoint");
                 `  }
                 `}
-                `
-                `// Also export some symbols that aren't valid entrypoints, but we should still
-                `// be allowed to point sockets at them. (Sending any actual requests to them
-                `// will still fail.)
-                `export let invalidObj = {};  // no handlers
-                `export let invalidArray = [1, 2];
-                `export let invalidMap = new Map();
             )
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
-      ( name = "alt1", address = "foo-addr", service = (name = "hello", entrypoint = "foo")),
-      ( name = "alt2", address = "bar-addr", service = (name = "hello", entrypoint = "bar")),
-
-      ( name = "invalid1", address = "invalid1-addr",
-        service = (name = "hello", entrypoint = "invalidObj")),
-      ( name = "invalid2", address = "invalid2-addr",
-        service = (name = "hello", entrypoint = "invalidArray")),
-      ( name = "invalid3", address = "invalid3-addr",
-        service = (name = "hello", entrypoint = "invalidMap")),
     ]
   ))"_kj);
 
   test.start();
 
-  {
-    auto conn = test.connect("test-addr");
-    conn.httpGet200("/", "hello from default entrypoint");
-  }
-
-  {
-    auto conn = test.connect("foo-addr");
-    conn.httpGet200("/", "hello from foo entrypoint");
-  }
-
-  {
-    auto conn = test.connect("bar-addr");
-    conn.httpGet200("/", "hello from bar entrypoint");
-  }
+  auto conn = test.connect("hello");
+  conn.httpGet200("/", "hello from default entrypoint");
 }
 
 KJ_TEST("Server: invalid entrypoint") {
@@ -1625,18 +1577,12 @@ KJ_TEST("Server: invalid entrypoint") {
           bindings = [(name = "svc", service = (name = "hello", entrypoint = "bar"))],
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
-      ( name = "alt1", address = "foo-addr", service = (name = "hello", entrypoint = "foo")),
     ]
   ))"_kj);
 
   test.expectErrors(
       "Worker \"hello\"'s binding \"svc\" refers to service \"hello\" with a named entrypoint "
-      "\"bar\", but \"hello\" has no such named entrypoint.\n"
-      "Socket \"alt1\" refers to service \"hello\" with a named entrypoint \"foo\", but \"hello\" "
-      "has no such named entrypoint.\n");
+      "\"bar\", but \"hello\" has no such named entrypoint.\n");
 }
 
 KJ_TEST("Server: referencing non-extant default entrypoint is not an error") {
@@ -1659,15 +1605,12 @@ KJ_TEST("Server: referencing non-extant default entrypoint is not an error") {
           ],
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
     ]
   ))"_kj);
   test.start();
 
   // A request will still fail at runtime, but we shouldn't have seen startup/config errors.
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   // Due to the Deep Magic (bugs) going back to the dawn of Module Workers, if an HTTP request is
@@ -1701,9 +1644,9 @@ KJ_TEST("Server: referencing non-extant default entrypoint is not an error") {
     wat)"_blockquote);
 }
 
-KJ_TEST("Server: referencing DO class as entrypoint is not an error") {
-  // For historical reasons, it's not a config error to refer to an actor class as a stateless
-  // entrypoint.
+KJ_TEST("Server: worker with DO class and default export") {
+  // A worker that exports both a DurableObject class and a default fetch handler should work fine.
+  // Requests go to the default entrypoint.
   TestServer test(R"((
     services = [
       ( name = "hello",
@@ -1725,41 +1668,13 @@ KJ_TEST("Server: referencing DO class as entrypoint is not an error") {
           ],
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = (name = "hello", entrypoint = "SomeActor")
-      ),
     ]
   ))"_kj);
 
-  // We see a log warning at config time, but config otherwise completes successfully.
-  {
-    // TODO(soon): Restore this warning once miniflare no longer generates config that causes
-    //   it to log spuriously.
-    //
-    // KJ_EXPECT_LOG(WARNING,
-    //     "A ServiceDesignator in the config referenced the entrypoint \"SomeActor\", but this "
-    //     "class does not extend 'WorkerEntrypoint'. Attempts to call this entrypoint will "
-    //     "fail at runtime, but historically this was not a startup-time error. Future "
-    //     "versions of workerd may make this a startup-time error.");
-    test.start();
-  }
+  test.start();
 
-  // However, a request will still fail at runtime.
-  KJ_EXPECT_LOG(ERROR, "worker is not an actor but class name was requested");
-  KJ_EXPECT_LOG(INFO, "Unable to get exported handler");
-  KJ_EXPECT_LOG(ERROR, "Unable to get exported handler");
-
-  auto conn = test.connect("test-addr");
-  conn.sendHttpGet("/");
-  conn.recv(R"(
-    HTTP/1.1 500 Internal Server Error
-    Connection: close
-    Content-Length: 21
-
-    Internal Server Error)"_blockquote);
+  auto conn = test.connect("hello");
+  conn.httpGet200("/", "OK");
 }
 
 KJ_TEST("Server: exporting a DO class as the default export is not an error") {
@@ -1783,12 +1698,6 @@ KJ_TEST("Server: exporting a DO class as the default export is not an error") {
             )
           ],
         )
-      ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
       ),
     ]
   ))"_kj);
@@ -1815,7 +1724,7 @@ KJ_TEST("Server: exporting a DO class as the default export is not an error") {
   // The behavior of this is quite strange. See the comment in the earlier test:
   //
   //   KJ_TEST("Server: referencing non-extant default entrypoint is not an error")
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   {
@@ -1867,12 +1776,6 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      ),
     ]
   ))"_kj);
 
@@ -1894,7 +1797,7 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
   KJ_EXPECT_LOG(INFO, "internal error");
   KJ_EXPECT_LOG(ERROR, "internal error");
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
   conn.recv(R"(
     HTTP/1.1 500 Internal Server Error
@@ -1959,18 +1862,12 @@ KJ_TEST("Server: call queue handler on service binding") {
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "service1"
-      )
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("service1");
   conn.httpGet200("/", "queue outcome: ok, ackAll: true");
 }
 
@@ -2020,17 +1917,11 @@ KJ_TEST("Server: Durable Objects (in memory)") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200(
       "/", "59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234: http://foo/ 0");
   conn.httpGet200(
@@ -2084,17 +1975,11 @@ KJ_TEST("Server: Simultaneous requests to a DO that hasn't started don't cause s
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "0 1 2");
 }
 
@@ -2147,18 +2032,12 @@ KJ_TEST("Server: Broken DO stays broken until stub replaced") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "0 0");
 }
 
@@ -2210,12 +2089,6 @@ KJ_TEST("Server: Durable Objects (on disk)") {
           writable = true,
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj;
 
@@ -2231,7 +2104,7 @@ KJ_TEST("Server: Durable Objects (on disk)") {
         kj::TransferMode::LINK);
 
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200(
         "/", "59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234: http://foo/ 0");
     conn.httpGet200(
@@ -2280,7 +2153,7 @@ KJ_TEST("Server: Durable Objects (on disk)") {
         kj::TransferMode::LINK);
 
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200(
         "/", "59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234: http://foo/ 4");
     conn.httpGet200(
@@ -2330,18 +2203,12 @@ KJ_TEST("Server: Ephemeral Objects") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "http://foo/: http://foo/ 0");
   conn.httpGet200("/", "http://foo/: http://foo/ 1");
   conn.httpGet200("/", "http://foo/: http://foo/ 2");
@@ -2416,24 +2283,18 @@ KJ_TEST("Server: Durable Objects (ephemeral) eviction") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/setup", "OK");
   conn.httpGet200("/check", "OK");
 
   // Force hibernation by waiting 10 seconds.
   test.wait(10);
   // Need a second connection because of 5 second HTTP timeout.
-  auto connTwo = test.connect("test-addr");
+  auto connTwo = test.connect("hello");
   connTwo.httpGet200("/checkEvicted", "OK");
 }
 
@@ -2493,24 +2354,18 @@ KJ_TEST("Server: Durable Objects (ephemeral) prevent eviction") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/setup", "OK");
   conn.httpGet200("/assertNotEvicted", "OK");
 
   // Attempt to force hibernation by waiting 10 seconds.
   test.wait(10);
   // Need a second connection because of 5 second HTTP timeout.
-  auto connTwo = test.connect("test-addr");
+  auto connTwo = test.connect("hello");
   connTwo.httpGet200("/assertNotEvicted", "OK");
 }
 
@@ -2605,12 +2460,6 @@ KJ_TEST("Server: Durable Object evictions when callback scheduled") {
           writable = true,
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj;
 
@@ -2624,7 +2473,7 @@ KJ_TEST("Server: Durable Object evictions when callback scheduled") {
         kj::TransferMode::LINK);
 
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     // Setup a callback that will run in 15 seconds.
     // This callback should prevent the DO from being evicted.
     conn.httpGet200("/15Seconds", "OK");
@@ -2637,27 +2486,27 @@ KJ_TEST("Server: Durable Object evictions when callback scheduled") {
     // The `setInterval()` will be cleared around now. Let's verify that we didn't get evicted.
 
     // Need a new connection because of 5 second HTTP timeout.
-    auto connTwo = test.connect("test-addr");
+    auto connTwo = test.connect("hello");
     connTwo.httpGet200("/assertActive", "OK");
 
     // Force hibernation by waiting at least 10 seconds since we haven't scheduled any new work.
     test.wait(10);
 
     // Need a new connection because of 5 second HTTP timeout.
-    auto connThree = test.connect("test-addr");
+    auto connThree = test.connect("hello");
     connThree.httpGet200("/assertEvicted", "OK");
 
     // Now we know we aren't evicting DOs early if they have future work scheduled. Next, let's
     // ensure we ARE evicting DOs if there are no connected clients for 70 seconds.
     // Note that the `/20seconds` path calls setInterval to run every 20 seconds, and never clears.
-    auto connFour = test.connect("test-addr");
+    auto connFour = test.connect("hello");
     connFour.httpGet200("/20Seconds", "OK");
     // It's unlikely, but the worst case is the cleanupLoop checks just before the 70 sec expiration,
     // and has to wait another 70 seconds before trying to remove again. We'll wait for 142 seconds
     // to account for this.
     test.wait(142);
 
-    auto connFive = test.connect("test-addr");
+    auto connFive = test.connect("hello");
     connFive.httpGet200("/assertEvictedAndCount", "OK");
   }
 }
@@ -2708,17 +2557,11 @@ KJ_TEST("Server: Durable Objects websocket") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto wsConn = test.connect("test-addr");
+  auto wsConn = test.connect("hello");
   wsConn.upgradeToWebSocket();
   constexpr kj::StringPtr expectedOne = "Hello"_kj;
   constexpr kj::StringPtr expectedTwo = "There"_kj;
@@ -2861,17 +2704,11 @@ KJ_TEST("Server: Durable Objects websocket hibernation") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto wsConn = test.connect("test-addr");
+  auto wsConn = test.connect("hello");
   wsConn.upgradeToWebSocket();
   // 1. Make hibernatable ws and use it.
   constexpr kj::StringPtr message = "Regular message."_kj;
@@ -2883,7 +2720,7 @@ KJ_TEST("Server: Durable Objects websocket hibernation") {
   test.wait(10);
   // 3. Use normal connection and read from ws.
   {
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/wakeUpAndCheckWS", "OK"_kj);
   }
   constexpr kj::StringPtr unpromptedResponse = "Hello! Just woke up from a nap."_kj;
@@ -2906,7 +2743,7 @@ KJ_TEST("Server: Durable Objects websocket hibernation") {
   KJ_EXPECT_LOG(INFO, "Error: test abort message");
   KJ_EXPECT_LOG(INFO, "other end of WebSocketPipe was destroyed");
   {
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/abort", "OK"_kj);
   }
 
@@ -2967,17 +2804,11 @@ KJ_TEST("Server: tail workers") {
           ],
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
   conn.recvHttp200("OK");
 
@@ -3025,19 +2856,12 @@ KJ_TEST("Server: serve proxy requests") {
               `})
         )
       )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello",
-        http = (style = proxy)
-      )
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   // Send a proxy-style request. No `Host:` header!
   conn.send(R"(
@@ -3053,177 +2877,9 @@ KJ_TEST("Server: serve proxy requests") {
   )"_blockquote);
 }
 
-KJ_TEST("Server: forwardedProtoHeader") {
-  TestServer test(R"((
-    services = [
-      ( name = "hello",
-        worker = (
-          compatibilityDate = "2022-08-17",
-          serviceWorkerScript =
-              `addEventListener("fetch", event => {
-              `  event.respondWith(new Response("Hello: " + event.request.url + "\n"));
-              `})
-        )
-      )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello",
-        http = (forwardedProtoHeader = "Test-Proto")
-      )
-    ]
-  ))"_kj);
-
-  test.start();
-
-  auto conn = test.connect("test-addr");
-
-  // Send a request with a forwarded proto header.
-  conn.send(R"(
-    GET /bar HTTP/1.1
-    Host: foo
-    tEsT-pRoTo: baz
-
-  )"_blockquote);
-  conn.recv(R"(
-    HTTP/1.1 200 OK
-    Content-Length: 21
-    Content-Type: text/plain;charset=UTF-8
-
-    Hello: baz://foo/bar
-  )"_blockquote);
-
-  // Send a request without one.
-  conn.send(R"(
-    GET /bar HTTP/1.1
-    Host: foo
-
-  )"_blockquote);
-  conn.recv(R"(
-    HTTP/1.1 200 OK
-    Content-Length: 22
-    Content-Type: text/plain;charset=UTF-8
-
-    Hello: http://foo/bar
-  )"_blockquote);
-}
-
-KJ_TEST("Server: cfBlobHeader") {
-  TestServer test(R"((
-    services = [
-      ( name = "hello",
-        worker = (
-          compatibilityDate = "2022-08-17",
-          serviceWorkerScript =
-              `addEventListener("fetch", event => {
-              `  if (event.request.cf) {
-              `    event.respondWith(new Response("cf.foo = " + event.request.cf.foo + "\n"));
-              `  } else {
-              `    event.respondWith(new Response("cf is null\n"));
-              `  }
-              `})
-        )
-      )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello",
-        http = (cfBlobHeader = "CF-Blob")
-      )
-    ]
-  ))"_kj);
-
-  test.start();
-
-  auto conn = test.connect("test-addr");
-
-  // Send a request with a CF blob.
-  conn.send(R"(
-    GET / HTTP/1.1
-    Host: bar
-    cF-bLoB: {"foo": "hello"}
-
-  )"_blockquote);
-  conn.recv(R"(
-    HTTP/1.1 200 OK
-    Content-Length: 15
-    Content-Type: text/plain;charset=UTF-8
-
-    cf.foo = hello
-  )"_blockquote);
-
-  // Send a request without one
-  conn.send(R"(
-    GET / HTTP/1.1
-    Host: bar
-
-  )"_blockquote);
-  conn.recv(R"(
-    HTTP/1.1 200 OK
-    Content-Length: 11
-    Content-Type: text/plain;charset=UTF-8
-
-    cf is null
-  )"_blockquote);
-}
-
-KJ_TEST("Server: inject headers on incoming request/response") {
-  TestServer test(R"((
-    services = [
-      ( name = "hello",
-        worker = (
-          compatibilityDate = "2022-08-17",
-          serviceWorkerScript =
-              `addEventListener("fetch", event => {
-              `  let text = [...event.request.headers]
-              `      .map(([k,v]) => { return `${k}: ${v}\n` }).join("");
-              `  event.respondWith(new Response(text));
-              `})
-        )
-      )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello",
-        http = (
-          injectRequestHeaders = [
-            (name = "Foo", value = "oof"),
-            (name = "Bar", value = "rab"),
-          ],
-          injectResponseHeaders = [
-            (name = "Baz", value = "zab"),
-            (name = "Qux", value = "xuq"),
-          ]
-        )
-      )
-    ]
-  ))"_kj);
-
-  test.start();
-
-  auto conn = test.connect("test-addr");
-
-  // Send a request, check headers.
-  conn.send(R"(
-    GET / HTTP/1.1
-    Host: example.com
-
-  )"_blockquote);
-  conn.recv(R"(
-    HTTP/1.1 200 OK
-    Content-Length: 36
-    Content-Type: text/plain;charset=UTF-8
-    Baz: zab
-    Qux: xuq
-
-    bar: rab
-    foo: oof
-    host: example.com
-  )"_blockquote);
-}
+// Tests for forwardedProtoHeader, cfBlobHeader, and inject headers were removed because these
+// features were configured via Socket HttpOptions, which has been removed in favor of PROXY v2
+// routing. These features remain available on ExternalServer HttpOptions.
 
 KJ_TEST("Server: drain incoming HTTP connections") {
   TestServer test(singleWorker(R"((
@@ -3238,8 +2894,8 @@ KJ_TEST("Server: drain incoming HTTP connections") {
 
   test.start(kj::mv(paf.promise));
 
-  auto conn = test.connect("test-addr");
-  auto conn2 = test.connect("test-addr");
+  auto conn = test.connect("hello");
+  auto conn2 = test.connect("hello");
 
   // Send a request on each connection, get a response.
   conn.httpGet200("/", "hello");
@@ -3262,7 +2918,7 @@ KJ_TEST("Server: drain incoming HTTP connections") {
   KJ_EXPECT(!conn2.isEof());
 
   // New connections shouldn't be accepted at this point.
-  KJ_EXPECT(test.connectHangs("test-addr"));
+  KJ_EXPECT(test.connectHangs("hello"));
 
   // Finish the request on conn2.
   conn2.send(" / HTTP/1.1\nHost: foo\n\n");
@@ -3290,15 +2946,12 @@ KJ_TEST("Server: network outbound with allow/deny") {
   TestServer test(R"((
     services = [
       (name = "hello", network = (allow = ["foo", "bar"], deny = ["baz", "qux"]))
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/path");
 
@@ -3324,15 +2977,12 @@ KJ_TEST("Server: external server") {
   TestServer test(R"((
     services = [
       (name = "hello", external = "ext-addr")
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/path");
 
@@ -3358,15 +3008,12 @@ KJ_TEST("Server: external server proxy style") {
   TestServer test(R"((
     services = [
       (name = "hello", external = (address = "ext-addr", http = (style = proxy)))
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/path");
 
@@ -3392,15 +3039,12 @@ KJ_TEST("Server: external server forwarded-proto") {
   TestServer test(R"((
     services = [
       (name = "hello", external = (address = "ext-addr", http = (forwardedProtoHeader = "X-Proto")))
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello", http = (style = proxy))
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.send(R"(
     GET https://foo/path HTTP/1.1
@@ -3444,15 +3088,12 @@ KJ_TEST("Server: external server inject headers") {
           )
         )
       )
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/path");
 
@@ -3503,15 +3144,12 @@ KJ_TEST("Server: external server cf blob header") {
         )
       ),
       (name = "ext", external = (address = "ext-addr", http = (cfBlobHeader = "CF-Blob")))
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/path");
 
@@ -3543,9 +3181,6 @@ KJ_TEST("Server: disk service") {
   TestServer test(R"((
     services = [
       (name = "hello", disk = "../../frob/blah")
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
@@ -3565,7 +3200,7 @@ KJ_TEST("Server: disk service") {
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/foo.txt");
   conn.recv(R"(
@@ -3755,9 +3390,6 @@ KJ_TEST("Server: disk service writable") {
   TestServer test(R"((
     services = [
       (name = "hello", disk = (path = "../../frob/blah", writable = true))
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
@@ -3767,7 +3399,7 @@ KJ_TEST("Server: disk service writable") {
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   // Write a file.
   conn.send(R"(
@@ -3938,9 +3570,6 @@ KJ_TEST("Server: disk service allow dotfiles") {
   TestServer test(R"((
     services = [
       (name = "hello", disk = (path = "../../frob", writable = true, allowDotfiles = true))
-    ],
-    sockets = [
-      (name = "main", address = "test-addr", service = "hello")
     ]
   ))"_kj);
 
@@ -3952,7 +3581,7 @@ KJ_TEST("Server: disk service allow dotfiles") {
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.send(R"(
     PUT /.dot HTTP/1.1
@@ -4044,7 +3673,7 @@ KJ_TEST("Server: If no cache service is defined, access to the cache API should 
   ))"_kj));
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "No Cache was configured");
 }
 
@@ -4070,17 +3699,11 @@ KJ_TEST("Server: cached response") {
         )
       ),
       ( name = "cache-outbound", external = "cache-host" ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   {
@@ -4129,17 +3752,11 @@ KJ_TEST("Server: cache name is passed through to service") {
         )
       ),
       ( name = "cache-outbound", external = "cache-host" ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   {
@@ -4214,12 +3831,6 @@ KJ_TEST("Server: cache name is passed through to service") {
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj;
 
@@ -4274,49 +3885,8 @@ KJ_TEST("Server: cache name is passed through to service") {
 
 // =======================================================================================
 
-KJ_TEST("Server: JS RPC over HTTP connections") {
-  // Test that we can send RPC over an ExternalServer pointing back to our own loopback socket,
-  // as long as both are configured with a `capnpConnectHost`.
-
-  TestServer test(R"((
-    services = [
-      ( name = "hello",
-        worker = (
-          compatibilityDate = "2024-02-23",
-          compatibilityFlags = ["experimental"],
-          modules = [
-            ( name = "main.js",
-              esModule =
-                `import {WorkerEntrypoint} from "cloudflare:workers";
-                `export default {
-                `  async fetch(request, env) {
-                `    return new Response("got: " + await env.OUT.frob(3, 11));
-                `  }
-                `}
-                `export class MyRpc extends WorkerEntrypoint {
-                `  async frob(a, b) { return a * b + 2; }
-                `}
-            )
-          ],
-          bindings = [( name = "OUT", service = "outbound")]
-        )
-      ),
-      (name = "outbound", external = (address = "loopback", http = (capnpConnectHost = "cappy")))
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
-      ( name = "alt1", address = "loopback",
-        service = (name = "hello", entrypoint = "MyRpc"),
-        http = (capnpConnectHost = "cappy")),
-    ]
-  ))"_kj);
-
-  test.server.allowExperimental();
-  test.start();
-
-  auto conn = test.connect("test-addr");
-  conn.httpGet200("/", "got: 35");
-}
+// Test for JS RPC over HTTP connections was removed because it required capnpConnectHost on the
+// incoming Socket, which has been removed in favor of PROXY v2 routing.
 
 KJ_TEST("Server: Entrypoint binding with props") {
   TestServer test(R"((
@@ -4352,16 +3922,13 @@ KJ_TEST("Server: Entrypoint binding with props") {
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "got: 123");
 }
 
@@ -4435,16 +4002,13 @@ KJ_TEST("Server: ctx.exports self-referential bindings") {
           durableObjectStorage = (inMemory = void)
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/",
       "foo: 123, bar: 321, baz: 234, corge: 555, grault: 456, LoopbackDurableObjectClass, "
       "{}, {\"foo\":123,\"bar\":\"abc\"}, false");
@@ -4479,16 +4043,13 @@ KJ_TEST("Server: loopback binding calls accept version property") {
           ],
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "constant");
 }
 
@@ -4528,17 +4089,11 @@ KJ_TEST("Server: encodeResponseBody: manual option") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveInternetSubrequest("subhost");
@@ -4587,17 +4142,11 @@ KJ_TEST("Server: encodeResponseBody: manual pass-through") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.sendHttpGet("/");
 
   auto subreq = test.receiveInternetSubrequest("subhost");
@@ -4683,12 +4232,6 @@ KJ_TEST("Server: Catch websocket server errors") {
           ]
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj);
 
@@ -4710,7 +4253,7 @@ KJ_TEST("Server: Catch websocket server errors") {
   headers.setPtr(kj::HttpHeaderId::HOST, "foo");
   headers.setPtr(kj::HttpHeaderId::UPGRADE, "websocket");
   {
-    auto wsConn = test.connect("test-addr");
+    auto wsConn = test.connect("hello");
     auto client = kj::newHttpClient(
         headerTable, wsConn.getStream(), kj::HttpClientSettings{.entropySource = entropySource});
     auto res = client->openWebSocket("/", headers).wait(waitScope);
@@ -4730,7 +4273,7 @@ KJ_TEST("Server: Catch websocket server errors") {
     KJ_EXPECT(resp.code == 1009);  // WebSocket-ese for "message too large"
   }
   {
-    auto wsConn = test.connect("test-addr");
+    auto wsConn = test.connect("hello");
     headers.setPtr(kj::HttpHeaderId::HOST, "foo");
     headers.setPtr(kj::HttpHeaderId::UPGRADE, "websocket");
     auto client = kj::newHttpClient(
@@ -4928,12 +4471,6 @@ KJ_TEST("Server: Durable Object facets") {
           writable = true,
         )
       ),
-    ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
     ]
   ))"_kj;
 
@@ -4949,7 +4486,7 @@ KJ_TEST("Server: Durable Object facets") {
 
     test.server.allowExperimental();
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/part1", "0 1 2 0 0 1 3 4");
   }
 
@@ -4990,7 +4527,7 @@ KJ_TEST("Server: Durable Object facets") {
 
     test.server.allowExperimental();
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/part2", "1 2 5 6");
   }
 
@@ -5015,7 +4552,7 @@ KJ_TEST("Server: Durable Object facets") {
 
     test.server.allowExperimental();
     test.start();
-    auto conn = test.connect("test-addr");
+    auto conn = test.connect("hello");
     conn.httpGet200("/props", "{} {\"aProp\":123} {} {\"bProp\":321} {} {\"cProp\":555}");
   }
 }
@@ -5055,16 +4592,13 @@ KJ_TEST("Server: Pass service stubs in ctx.props.") {
           ],
         )
       ),
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" ),
     ]
   ))"_kj);
 
   test.server.allowExperimental();
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "Hello, Alice!\nWelcome, Bob!");
 }
 
@@ -5149,12 +4683,6 @@ KJ_TEST("Server: structured logging with console methods") {
         )
       )
     ],
-    sockets = [
-      ( name = "main",
-        address = "test-addr",
-        service = "hello"
-      )
-    ],
     # Enable structured logging for this test
     structuredLogging = true
   ))"_kj,
@@ -5175,7 +4703,7 @@ KJ_TEST("Server: structured logging with console methods") {
 
   test.server.allowExperimental();
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
 
   conn.sendHttpGet("/");
   conn.recvHttp200("Structured logging test completed");
@@ -5269,7 +4797,7 @@ KJ_TEST("Server: transpiled typescript") {
   ))"_kj));
   test.server.allowExperimental();
   test.start();
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("hello");
   conn.httpGet200("/", "Hello from typescript");
 }
 
@@ -5477,9 +5005,6 @@ KJ_TEST("Server: debug port RPC calls") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "hello" )
     ]
   ))"_kj);
 
@@ -5492,7 +5017,7 @@ KJ_TEST("Server: debug port RPC calls") {
   test.start();
 
   // Connect to the debug port
-  auto debugConn = test.connect("debug-addr");
+  auto debugConn = test.connectRaw("debug-addr");
 
   // Create a TwoPartyClient for Cap'n Proto RPC
   capnp::TwoPartyClient client(debugConn.getStream());
@@ -5727,9 +5252,6 @@ KJ_TEST("Server: workerdDebugPort binding loopback test") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "test-service" )
     ]
   ))"_kj);
 
@@ -5740,7 +5262,7 @@ KJ_TEST("Server: workerdDebugPort binding loopback test") {
   test.start();
 
   // Run the test by invoking the fetch handler
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("test-service");
   conn.httpGet200("/", "All tests passed!");
 }
 
@@ -5803,9 +5325,6 @@ KJ_TEST("Server: workerdDebugPort binding with props") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "test-service" )
     ]
   ))"_kj);
 
@@ -5814,7 +5333,7 @@ KJ_TEST("Server: workerdDebugPort binding with props") {
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("test-service");
   conn.httpGet200("/", "Props test passed!");
 }
 
@@ -5903,9 +5422,6 @@ KJ_TEST("Server: workerdDebugPort binding getActor") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "test-service" )
     ]
   ))"_kj);
 
@@ -5914,7 +5430,7 @@ KJ_TEST("Server: workerdDebugPort binding getActor") {
 
   test.start();
 
-  auto conn = test.connect("test-addr");
+  auto conn = test.connect("test-service");
   conn.httpGet200("/", "DO actor test passed!");
 }
 
@@ -5986,9 +5502,6 @@ KJ_TEST("Server: workerdDebugPort WebSocket passthrough via WorkerEntrypoint") {
           ]
         )
       )
-    ],
-    sockets = [
-      ( name = "main", address = "test-addr", service = "proxy-service" )
     ]
   ))"_kj);
 
@@ -5998,7 +5511,7 @@ KJ_TEST("Server: workerdDebugPort WebSocket passthrough via WorkerEntrypoint") {
   test.start();
 
   // Connect and upgrade to WebSocket
-  auto wsConn = test.connect("test-addr");
+  auto wsConn = test.connect("proxy-service");
   wsConn.upgradeToWebSocket();
 
   // Send a message and verify we get the echoed response
@@ -6012,5 +5525,74 @@ KJ_TEST("Server: workerdDebugPort WebSocket passthrough via WorkerEntrypoint") {
   wsConn.send(kj::str("\x81\x05", testMessage2));
   wsConn.recvWebSocket("echo:world");
 }
+
+// =======================================================================================
+// Socket allowed-services tests
+
+KJ_TEST("Server: config socket with allowed services accepts valid worker ID") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request) {
+                `    return new Response("Hello from allowed service");
+                `  }
+                `}
+            )
+          ]
+        )
+      )
+    ],
+    sockets = [
+      ( name = "default", address = "*:0", http = (),
+        services = ["hello"] )
+    ]
+  ))"_kj);
+
+  test.start();
+  auto conn = test.connect("hello");
+  conn.httpGet200("/", "Hello from allowed service");
+}
+
+KJ_TEST("Server: config socket rejects disallowed worker ID") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request) {
+                `    return new Response("Should not reach here");
+                `  }
+                `}
+            )
+          ]
+        )
+      )
+    ],
+    sockets = [
+      ( name = "default", address = "*:0", http = (),
+        services = ["hello"] )
+    ]
+  ))"_kj);
+
+  test.start();
+
+  // Connect with a disallowed service name. The server should close the connection
+  // after seeing the PROXY v2 header with an unknown worker ID.
+  auto conn = test.connect("not-allowed");
+
+  // The connection should be closed (EOF) since the server rejected the worker ID.
+  KJ_EXPECT(conn.isEof());
+}
+
 }  // namespace
 }  // namespace workerd::server

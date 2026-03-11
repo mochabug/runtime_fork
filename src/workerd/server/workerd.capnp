@@ -47,8 +47,7 @@ struct Config {
   services @0 :List(Service);
   # List of named services defined by this server. These names are private; they are only used
   # to refer to the services from elsewhere in this config file, as well as for logging and the
-  # like. Services are not reachable until you configure some way to make them reachable, such
-  # as via a Socket.
+  # like. Services are reachable via CLI flags (--listen) and PROXY v2 routing.
   #
   # If you do not define any service called "internet", one is defined implicitly, representing
   # the ability to access public internet servers. An explicit definition would look like:
@@ -64,8 +63,14 @@ struct Config {
   # configuration specifies some other service using the `globalOutbound` setting.
 
   sockets @1 :List(Socket);
-  # List of sockets on which this server will listen, and the services that will be exposed
-  # through them.
+  # List of sockets on which this server listens for connections. Each socket can serve one or
+  # more services, with PROXY v2 routing selecting the correct service based on worker ID.
+  #
+  # Sockets defined here complement CLI --listen flags. Each socket specifies a listen address
+  # and the set of services it accepts connections for.
+  #
+  # Socket addresses can be overridden on the command line using --socket-addr <name>=<addr>
+  # or --socket-fd <name>=<fd>.
 
   v8Flags @2 :List(Text);
   # List of "command-line" flags to pass to V8, like "--expose-gc". We put these in the config
@@ -115,43 +120,32 @@ struct LoggingOptions {
 # Sockets
 
 struct Socket {
+  # Defines a named listen socket. A socket listens for incoming connections and routes them
+  # to one of the services listed in its `services` field based on the PROXY v2 worker ID.
+
   name @0 :Text;
-  # Each socket has a unique name which can be used on the command line to override the socket's
-  # address with `--socket-addr <name>=<addr>` or `--socket-fd <name>=<fd>`.
+  # Unique name for this socket. Can be used to override the listen address on the command line
+  # with --socket-addr <name>=<addr> or --socket-fd <name>=<fd>.
 
   address @1 :Text;
-  # Address/port on which this socket will listen. Optional; if not specified, then you will be
-  # required to specify the socket on the command line with with `--socket-addr <name>=<addr>` or
-  # `--socket-fd <name>=<fd>`.
-  #
-  # Examples:
-  # - "*:80": Listen on port 80 on all local IPv4 and IPv6 interfaces.
-  # - "1.2.3.4": Listen on the specific IPv4 address on the default port for the protocol.
-  # - "1.2.3.4:80": Listen on the specific IPv4 address and port.
-  # - "1234:5678::abcd": Listen on the specific IPv6 address on the default port for the protocol.
-  # - "[1234:5678::abcd]:80": Listen on the specific IPv6 address and port.
-  # - "unix:/path/to/socket": Listen on a Unix socket.
-  # - "unix-abstract:name": On Linux, listen on the given "abstract" Unix socket name.
-  # - "example.com:80": Perform a DNS lookup to determine the address, and then listen on it. If
-  #     this resolves to multiple addresses, listen on all of them.
-  #
-  # (These are the formats supported by KJ's parseAddress().)
+  # Listen address in KJ parseAddress format (e.g. "*:8080", "127.0.0.1:9090", "unix:/path").
+  # Optional if overridden via CLI.
 
   union {
     http @2 :HttpOptions;
+    # Accept HTTP connections on this socket.
+
     https :group {
       options @3 :HttpOptions;
       tlsOptions @4 :TlsOptions;
     }
-
-    # TODO(someday): TCP, TCP proxy, SMTP, Cap'n Proto, ...
+    # Accept HTTPS connections on this socket (terminate TLS).
   }
 
-  service @5 :ServiceDesignator;
-  # Service name which should handle requests on this socket.
-
-  # TODO(someday): Support mapping different hostnames to different services? Or should that be
-  #   done strictly via JavaScript?
+  services @5 :List(ServiceDesignator);
+  # Services that can receive connections on this socket.
+  # PROXY v2 worker ID determines which service handles each connection.
+  # Connections with a worker ID not in this list are rejected.
 }
 
 # ========================================================================================
@@ -163,8 +157,8 @@ struct Service {
 
   name @0 :Text;
   # Name of the service. Used only to refer to the service from elsewhere in the config file.
-  # Services are not accessible unless you explicitly configure them to be, such as through a
-  # `Socket` or through a binding from another Worker.
+  # Services are not accessible unless you explicitly configure them to be, such as through
+  # a socket definition, CLI listen flags, or a binding from another Worker.
 
   union {
     unspecified @1 :Void;
@@ -929,7 +923,7 @@ struct HttpOptions {
   injectRequestHeaders @3 :List(Header);
   # List of headers which will be automatically injected into all requests. This can be used
   # e.g. to add an authorization token to all requests when using `ExternalServer`. It can also
-  # apply to incoming requests received on a `Socket` to modify the headers that will be delivered
+  # apply to incoming requests to modify the headers that will be delivered
   # to the app. Any existing header with the same name is removed.
 
   injectResponseHeaders @4 :List(Header);

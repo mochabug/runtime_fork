@@ -8,9 +8,7 @@ using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   # We have one nanoservice: the chat worker.
   services = [ (name = "chat", worker = .chatWorker) ],
-
-  # We export it via HTTP on port 8080.
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "chat" ) ],
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["chat"] ) ],
 );
 
 # For legibility we define the Worker's config as a separate constant.

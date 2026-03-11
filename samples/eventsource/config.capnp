@@ -10,8 +10,7 @@ const eventSourceExample :Workerd.Config = (
     (name = "main", worker = .eventsource),
     (name = "internet", network = (allow = ["private"]))
   ],
-
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 const eventsource :Workerd.Worker = (

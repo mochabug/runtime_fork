@@ -4,8 +4,7 @@ const helloWorldExample :Workerd.Config = (
   services = [
     (name = "main", worker = .helloWorld),
   ],
-
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 const helloWorld :Workerd.Worker = (

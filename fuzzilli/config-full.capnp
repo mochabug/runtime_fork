@@ -11,9 +11,7 @@ const reprl :Workerd.Config = (
     (name = "test-analytics", worker = .analyticsMockWorker),
     (name = "test-queue", worker = .queueMockWorker),
   ],
-
-  # We don't need sockets for REPRL mode as it uses direct file descriptors
-  # sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ]
 );
 
 const replServer :Workerd.Worker = (

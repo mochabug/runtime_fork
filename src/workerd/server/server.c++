@@ -5,6 +5,7 @@
 #include "server.h"
 
 #include "container-client.h"
+#include "proxy-protocol.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -5782,108 +5783,206 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
   }
 }
 
+class Server::ProxyRoutingListener final: public kj::Refcounted {
+ public:
+  ProxyRoutingListener(Server& owner,
+      kj::Own<kj::ConnectionReceiver> listener,
+      kj::HttpHeaderTable& headerTable,
+      kj::Timer& timer,
+      kj::HashSet<kj::String> allowedServices = {})
+      : owner(owner),
+        listener(kj::mv(listener)),
+        headerTable(headerTable),
+        timer(timer),
+        allowedServices(kj::mv(allowedServices)) {}
+
+  kj::Promise<void> run() {
+    for (;;) {
+      auto stream = co_await listener->accept();
+
+      // Parse PROXY v2 header from the connection.
+      auto result = co_await parseProxyV2FromStream(*stream);
+      if (!result.success) continue;  // read failed, close connection
+
+      KJ_IF_SOME(workerId, result.workerId) {
+        // If this listener has an allowed-services set, check it.
+        if (allowedServices.size() > 0 && !allowedServices.contains(workerId)) {
+          KJ_LOG(WARNING, "Worker ID not in socket's allowed services", workerId);
+          continue;
+        }
+
+        // Look up service by worker ID.
+        auto& serviceRef = KJ_UNWRAP_OR(owner.services.find(workerId), {
+          KJ_LOG(WARNING, "Unknown worker ID in PROXY v2 header", workerId);
+          continue;
+        });
+
+        kj::Own<Service> service(serviceRef.get(), kj::NullDisposer::instance);
+
+        // Spawn connection handler as a task.
+        owner.tasks.add(handleConnection(kj::addRef(*this), kj::mv(stream), kj::mv(service)));
+      } else {
+        continue;  // no worker ID → close
+      }
+    }
+  }
+
+ private:
+  Server& owner;
+  kj::Own<kj::ConnectionReceiver> listener;
+  kj::HttpHeaderTable& headerTable;
+  kj::Timer& timer;
+  kj::HashSet<kj::String> allowedServices;
+
+  static kj::Promise<void> handleConnection(
+      kj::Own<ProxyRoutingListener> self,
+      kj::Own<kj::AsyncIoStream> stream,
+      kj::Own<Service> service) {
+    auto conn = kj::heap<ConnectionHandler>(*self, kj::mv(service));
+    auto& connRef = *conn;
+    try {
+      co_await connRef.listedHttp.httpServer.listenHttp(kj::mv(stream));
+    } catch (...) {
+      KJ_LOG(ERROR, kj::getCaughtExceptionAsKj());
+    }
+  }
+
+  struct ConnectionHandler final: public kj::HttpService, public kj::HttpServerErrorHandler {
+    ConnectionHandler(ProxyRoutingListener& parent, kj::Own<Service> service)
+        : parent(parent),
+          service(kj::mv(service)),
+          webSocketErrorHandler(kj::heap<JsgifyWebSocketErrors>()),
+          listedHttp(parent.owner,
+              parent.timer,
+              parent.headerTable,
+              *this,
+              kj::HttpServerSettings{.errorHandler = *this,
+                .webSocketErrorHandler = *webSocketErrorHandler,
+                .webSocketCompressionMode = kj::HttpServerSettings::MANUAL_COMPRESSION}) {}
+
+    ProxyRoutingListener& parent;
+    kj::Own<Service> service;
+    kj::Own<JsgifyWebSocketErrors> webSocketErrorHandler;
+    ListedHttpServer listedHttp;
+
+    kj::Promise<void> request(kj::HttpMethod method,
+        kj::StringPtr url,
+        const kj::HttpHeaders& headers,
+        kj::AsyncInputStream& requestBody,
+        kj::HttpService::Response& response) override {
+      IoChannelFactory::SubrequestMetadata metadata;
+
+      kj::String fullUrl;
+      kj::StringPtr urlToUse = url;
+
+      if (url.startsWith("http://") || url.startsWith("https://")) {
+        // Proxy-style request — URL already has scheme+host, pass through as-is.
+      } else {
+        // Normal request — combine path with Host header to build full URL.
+        auto host = KJ_UNWRAP_OR(headers.get(kj::HttpHeaderId::HOST), {
+          co_return co_await response.sendError(400, "Bad Request", parent.headerTable);
+        });
+        auto parsed = kj::Url::parse(url, kj::Url::HTTP_REQUEST,
+            kj::Url::Options{.percentDecode = false, .allowEmpty = true});
+        parsed.host = kj::str(host);
+        parsed.scheme = kj::str("http");
+        fullUrl = parsed.toString(kj::Url::HTTP_PROXY_REQUEST);
+        urlToUse = fullUrl;
+      }
+
+      auto worker = service->startRequest(kj::mv(metadata));
+      co_return co_await worker->request(method, urlToUse, headers, requestBody, response);
+    }
+
+    kj::Promise<void> connect(kj::StringPtr host,
+        const kj::HttpHeaders& headers,
+        kj::AsyncIoStream& connection,
+        ConnectResponse& response,
+        kj::HttpConnectSettings settings) override {
+      return kj::HttpService::connect(host, headers, connection, response, kj::mv(settings));
+    }
+
+    kj::Promise<void> handleApplicationError(
+        kj::Exception exception, kj::Maybe<kj::HttpService::Response&> response) override {
+      if (exception.getType() == kj::Exception::Type::DISCONNECTED) {
+        co_return;
+      }
+      KJ_LOG(ERROR, kj::str("Uncaught exception: ", exception));
+      KJ_IF_SOME(r, response) {
+        co_return co_await r.sendError(500, "Internal Server Error", parent.headerTable);
+      }
+    }
+  };
+};
+
 kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
     kj::HttpHeaderTable::Builder& headerTableBuilder,
     kj::ForkedPromise<void>& forkedDrainWhen,
     bool forTest) {
-  // ---------------------------------------------------------------------------
-  // Start sockets
   TRACE_EVENT("workerd", "listenOnSockets");
-  for (auto sock: config.getSockets()) {
-    kj::StringPtr name = sock.getName();
-    kj::StringPtr addrStr = nullptr;
-    kj::String ownAddrStr;
-    kj::Maybe<kj::Own<kj::ConnectionReceiver>> listenerOverride;
 
-    kj::Own<Service> service = lookupService(sock.getService(), kj::str("Socket \"", name, "\""));
+  // Process config-defined sockets.
+  for (auto socket: config.getSockets()) {
+    kj::StringPtr name = socket.getName();
 
-    KJ_IF_SOME(override, socketOverrides.findEntry(name)) {
-      KJ_SWITCH_ONEOF(override.value) {
-        KJ_CASE_ONEOF(str, kj::String) {
-          addrStr = ownAddrStr = kj::mv(str);
-          break;
-        }
-        KJ_CASE_ONEOF(l, kj::Own<kj::ConnectionReceiver>) {
-          listenerOverride = kj::mv(l);
-          break;
-        }
-      }
-      socketOverrides.erase(override);
-    } else if (sock.hasAddress()) {
-      addrStr = sock.getAddress();
+    // Build allowed-services set from socket's services list.
+    kj::HashSet<kj::String> allowedServices;
+    for (auto svc: socket.getServices()) {
+      allowedServices.insert(kj::str(svc.getName()));
+    }
+
+    // Check for CLI override of this socket's address/fd.
+    KJ_IF_SOME(override, socketOverrides.find(name)) {
+      auto obj = kj::refcounted<ProxyRoutingListener>(
+          *this, kj::mv(override.receiver),
+          globalContext->headerTable, timer, kj::mv(allowedServices));
+      tasks.add(obj->run().attach(kj::mv(obj)).exclusiveJoin(forkedDrainWhen.addBranch()));
+      socketOverrides.erase(name);
     } else {
-      reportConfigError(kj::str("Socket \"", name,
-          "\" has no address in the config, so must be specified on the "
-          "command line with `--socket-addr`."));
-      continue;
-    }
+      // Parse address from config and start listening.
+      auto addr = kj::str(socket.getAddress());
+      auto handle = kj::coCapture(
+          [this, addr = kj::mv(addr), allowedServices = kj::mv(allowedServices),
+              socket](kj::ForkedPromise<void>& drain) mutable -> kj::Promise<void> {
+        auto parsed = co_await network.parseAddress(addr, 80);
+        auto listener = parsed->listen();
 
-    uint defaultPort = 0;
-    config::HttpOptions::Reader httpOptions;
-    kj::Maybe<kj::Own<kj::TlsContext>> tls;
-    kj::StringPtr physicalProtocol;
-    switch (sock.which()) {
-      case config::Socket::HTTP:
-        defaultPort = 80;
-        httpOptions = sock.getHttp();
-        physicalProtocol = "http";
-        goto validSocket;
-      case config::Socket::HTTPS: {
-        auto https = sock.getHttps();
-        defaultPort = 443;
-        httpOptions = https.getOptions();
-        tls = makeTlsContext(https.getTlsOptions());
-        physicalProtocol = "https";
-        goto validSocket;
-      }
-    }
-    reportConfigError(kj::str("Encountered unknown socket type in \"", name,
-        "\". Was the config compiled with a "
-        "newer version of the schema?"));
-    continue;
-
-  validSocket:
-    using PromisedReceived = kj::Promise<kj::Own<kj::ConnectionReceiver>>;
-    PromisedReceived listener = nullptr;
-    KJ_IF_SOME(l, listenerOverride) {
-      listener = kj::mv(l);
-    } else {
-      listener = ([](kj::Promise<kj::Own<kj::NetworkAddress>> promise) -> PromisedReceived {
-        auto parsed = co_await promise;
-        co_return parsed->listen();
-      })(network.parseAddress(addrStr, defaultPort));
-    }
-
-    KJ_IF_SOME(t, tls) {
-      listener = ([](kj::Promise<kj::Own<kj::ConnectionReceiver>> promise,
-                      kj::Own<kj::TlsContext> tls) -> PromisedReceived {
-        auto port = co_await promise;
-        co_return tls->wrapPort(kj::mv(port)).attach(kj::mv(tls));
-      })(kj::mv(listener), kj::mv(t));
-    }
-
-    // Need to create rewriter before waiting on anything since `headerTableBuilder` will no longer
-    // be available later.
-    auto rewriter = kj::heap<HttpRewriter>(httpOptions, headerTableBuilder);
-
-    auto handle = kj::coCapture(
-        [this, service = kj::mv(service), rewriter = kj::mv(rewriter), physicalProtocol, name](
-            kj::Promise<kj::Own<kj::ConnectionReceiver>> promise) mutable -> kj::Promise<void> {
-      TRACE_EVENT("workerd", "setup listenHttp");
-      auto listener = co_await promise;
-      KJ_IF_SOME(stream, controlOverride) {
-        auto message = kj::str("{\"event\":\"listen\",\"socket\":\"", name,
-            "\",\"port\":", listener->getPort(), "}\n");
-        try {
-          stream->write(message.asBytes());
-        } catch (kj::Exception& e) {
-          KJ_LOG(ERROR, e);
+        KJ_IF_SOME(stream, controlOverride) {
+          auto message = kj::str("{\"event\":\"listen\",\"socket\":\"",
+              socket.getName(), "\",\"port\":", listener->getPort(), "}\n");
+          try {
+            stream->write(message.asBytes());
+          } catch (kj::Exception& e) {
+            KJ_LOG(ERROR, e);
+          }
         }
-      }
-      co_await listenHttp(kj::mv(listener), kj::mv(service), physicalProtocol, kj::mv(rewriter));
-    });
-    tasks.add(handle(kj::mv(listener)).exclusiveJoin(forkedDrainWhen.addBranch()));
+
+        if (socket.isHttps()) {
+          auto tlsContext = makeTlsContext(socket.getHttps().getTlsOptions());
+          auto tlsListener = tlsContext->wrapPort(kj::mv(listener));
+          auto obj = kj::refcounted<ProxyRoutingListener>(
+              *this, kj::mv(tlsListener),
+              globalContext->headerTable, timer, kj::mv(allowedServices));
+          co_await obj->run().attach(kj::mv(obj), kj::mv(tlsContext));
+        } else {
+          auto obj = kj::refcounted<ProxyRoutingListener>(
+              *this, kj::mv(listener),
+              globalContext->headerTable, timer, kj::mv(allowedServices));
+          co_await obj->run().attach(kj::mv(obj));
+        }
+      });
+      tasks.add(handle(forkedDrainWhen).exclusiveJoin(forkedDrainWhen.addBranch()));
+    }
   }
+
+  // Process remaining socket overrides (from dispatcher or test setup, not matching config sockets).
+  for (auto& entry: socketOverrides) {
+    auto obj = kj::refcounted<ProxyRoutingListener>(
+        *this, kj::mv(entry.value.receiver),
+        globalContext->headerTable, timer);
+    tasks.add(obj->run().attach(kj::mv(obj)).exclusiveJoin(forkedDrainWhen.addBranch()));
+  }
+  socketOverrides.clear();
 
   // Start debug port if configured
   KJ_IF_SOME(addr, debugPortOverride) {
@@ -5906,12 +6005,6 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
       co_await listenDebugPort(kj::mv(listener));
     });
     tasks.add(handle(forkedDrainWhen).exclusiveJoin(forkedDrainWhen.addBranch()));
-  }
-
-  for (auto& unmatched: socketOverrides) {
-    reportConfigError(kj::str("Config did not define any socket named \"", unmatched.key,
-        "\" to match the override "
-        "provided on the command line."));
   }
 
   for (auto& unmatched: externalOverrides) {

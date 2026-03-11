@@ -4,15 +4,10 @@ const config :Workerd.Config = (
   services = [
     (name = "main", worker = .mainWorker),
   ],
-
   sockets = [
-    # Serve HTTP on port 8080.
-    ( name = "http",
-      address = "*:8080",
-      http = (),
-      service = "main"
-    ),
+    ( name = "http", address = "*:8080", http = (), services = ["main"] ),
   ],
+
   autogates = [
     # Pyodide is included as a builtin wasm module so it requires the
     # corresponding autogate flag.

@@ -14,11 +14,7 @@ const helloWorldExample :Workerd.Config = (
   # ability to talk to a network, or accessing a disk directory. Here we create a single
   # worker service. The configuration details for the worker are defined below.
   services = [ (name = "main", worker = .helloWorld) ],
-
-  # Every configuration defines the one or more sockets on which the server will listene.
-  # Here, we create a single socket that will listen on localhost port 8080, and will
-  # dispatch to the "main" service that we defined above.
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 # The definition of the actual helloWorld worker exposed using the "main" service.

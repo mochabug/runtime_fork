@@ -3,8 +3,7 @@ using Workerd = import "/workerd/workerd.capnp";
 
 const ReplServer :Workerd.Config = (
   services = [ (name = "main", worker = .replServer) ],
-
-  sockets = [ ( name = "http", address = "*:8080", http = (), service = "main" ) ]
+  sockets = [ ( name = "http", address = "*:8080", http = (), services = ["main"] ) ],
 );
 
 const replServer :Workerd.Worker = (

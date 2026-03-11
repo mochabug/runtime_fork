@@ -73,32 +73,5 @@ const unitTests :Workerd.Config = (
       )
     ),
   ],
-  sockets = [
-    ( name = "MyService-loop",
-      address = "loopback:MyService-loop",
-      service = (name = "js-rpc-test", entrypoint = "MyService"),
-      http = (capnpConnectHost = "cappy")
-    ),
-    ( name = "MyServiceProxy-loop",
-      address = "loopback:MyServiceProxy-loop",
-      service = (name = "js-rpc-test", entrypoint = "MyServiceProxy"),
-      http = (capnpConnectHost = "cappy")
-    ),
-    ( name = "nonClass-loop",
-      address = "loopback:nonClass-loop",
-      service = (name = "js-rpc-test", entrypoint = "nonClass"),
-      http = (capnpConnectHost = "cappy")
-    ),
-    ( name = "default-loop",
-      address = "loopback:default-loop",
-      service = (name = "js-rpc-test"),
-      http = (capnpConnectHost = "cappy")
-    ),
-    ( name = "GreeterFactory-loop",
-      address = "loopback:GreeterFactory-loop",
-      service = (name = "js-rpc-test", entrypoint = "GreeterFactory"),
-      http = (capnpConnectHost = "cappy")
-    ),
-  ],
   v8Flags = [ "--expose-gc" ],
 );
