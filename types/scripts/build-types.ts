@@ -34,7 +34,7 @@ function buildProxyV2Header(workerId: string): Buffer {
 // Uses a raw TCP connection with manual HTTP/1.1 formatting.
 async function proxyV2Fetch(url: string | URL, workerId: string): Promise<Response> {
   const parsed = new URL(url);
-  const socket = net.connect(parseInt(parsed.port), parsed.hostname!);
+  const socket = net.connect(parseInt(parsed.port), parsed.hostname);
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", resolve);
     socket.once("error", reject);

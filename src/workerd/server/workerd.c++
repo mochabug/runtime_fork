@@ -1565,6 +1565,44 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       listenFds[numCliFds + s] = configListenFds[s];
     }
 
+    // Per-socket metadata: detect single-service sockets that don't need PROXY v2.
+    struct SocketMeta {
+      bool isSingleService = false;
+      kj::String defaultServiceName;
+      uint defaultCore = 0;
+    };
+    auto socketMetas = kj::heapArray<SocketMeta>(numListenFds);
+
+    // CLI sockets: if the entire config has exactly one worker service, mark as single-service.
+    if (nextCore == 1) {
+      // Find the single worker service name.
+      for (auto service: config.getServices()) {
+        if (service.isWorker()) {
+          auto name = kj::str(service.getName());
+          uint core = KJ_ASSERT_NONNULL(serviceToCore.find(name));
+          for (uint s = 0; s < numCliFds; s++) {
+            socketMetas[s].isSingleService = true;
+            socketMetas[s].defaultServiceName = kj::str(name);
+            socketMetas[s].defaultCore = core;
+          }
+          break;
+        }
+      }
+    }
+
+    // Config sockets: check if each has exactly one service.
+    for (uint s = 0; s < numConfigFds; s++) {
+      auto services = configSockets[s].getServices();
+      if (services.size() == 1) {
+        auto name = kj::str(services[0].getName());
+        KJ_IF_SOME(core, serviceToCore.find(name)) {
+          socketMetas[numCliFds + s].isSingleService = true;
+          socketMetas[numCliFds + s].defaultServiceName = kj::mv(name);
+          socketMetas[numCliFds + s].defaultCore = core;
+        }
+      }
+    }
+
     // Create shared drain infrastructure: one fulfiller per core.
     auto drainFulfillers = kj::heapArray<
         kj::MutexGuarded<kj::Maybe<kj::Own<kj::CrossThreadPromiseFulfiller<void>>>>>(coreCount);
@@ -1749,6 +1787,12 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
                   targetCore = core;
                 }
                 allReceivers[targetCore][s]->pushConnection(connFd, kj::mv(result.preamble));
+              } else if (socketMetas[s].isSingleService) {
+                // Plain HTTP on a single-service socket: synthesize PROXY v2 header
+                // so the worker thread's ProxyRoutingListener can process it normally.
+                auto syntheticHeader = buildProxyV2Header(socketMetas[s].defaultServiceName);
+                allReceivers[socketMetas[s].defaultCore][s]->pushConnection(
+                    connFd, kj::mv(syntheticHeader));
               } else {
                 close(connFd);
                 continue;
