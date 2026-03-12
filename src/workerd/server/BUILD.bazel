@@ -239,11 +239,33 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "s3-auth",
+    srcs = ["s3-auth.c++"],
+    hdrs = ["s3-auth.h"],
+    deps = [
+        "@capnp-cpp//src/kj",
+        "@ssl",
+    ],
+)
+
+wd_cc_library(
+    name = "s3-worker-fetcher",
+    srcs = ["s3-worker-fetcher.c++"],
+    hdrs = ["s3-worker-fetcher.h"],
+    deps = [
+        ":s3-auth",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+wd_cc_library(
     name = "server",
     srcs = [
+        "s3-worker-lru.c++",
         "server.c++",
     ],
     hdrs = [
+        "s3-worker-lru.h",
         "server.h",
     ],
     deps = [
@@ -255,6 +277,7 @@ wd_cc_library(
         ":facet-tree-index",
         ":fallback-service",
         ":proxy-protocol",
+        ":s3-worker-fetcher",
         ":workerd-api",
         ":workerd_capnp",
         "//src/cloudflare",
@@ -367,6 +390,14 @@ wd_capnp_library(
         ":__pkg__",
         "//src/workerd/api:__pkg__",
         "//src/workerd/tests:__pkg__",
+    ],
+)
+
+kj_test(
+    size = "large",
+    src = "s3-worker-lru-test.c++",
+    deps = [
+        ":server",
     ],
 )
 

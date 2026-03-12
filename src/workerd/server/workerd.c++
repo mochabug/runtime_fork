@@ -4,6 +4,7 @@
 
 #include "cross-thread-receiver.h"
 #include "proxy-protocol.h"
+#include "s3-worker-fetcher.h"
 #include "server.h"
 
 #include <workerd/api/unsafe.h>
@@ -913,6 +914,21 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     listenAddresses.add(kj::str(addr));
   }
 
+  void setS3Endpoint(kj::StringPtr val) { s3Endpoint = kj::str(val); }
+  void setS3AccessKeyFile(kj::StringPtr val) { s3AccessKeyFile = kj::str(val); }
+  void setS3SecretKeyFile(kj::StringPtr val) { s3SecretKeyFile = kj::str(val); }
+  void setS3Bucket(kj::StringPtr val) { s3Bucket = kj::str(val); }
+  void setS3CacheDir(kj::StringPtr val) { s3CacheDir = kj::str(val); }
+  void setS3CompatDate(kj::StringPtr val) { s3CompatDate = kj::str(val); }
+  void setS3LruMaxWorkers(kj::StringPtr val) { s3LruMaxWorkers = val.parseAs<size_t>(); }
+  void setS3LruSoftMemoryMb(kj::StringPtr val) { s3LruSoftMemoryMb = val.parseAs<size_t>(); }
+  void setS3LruHardMemoryMb(kj::StringPtr val) { s3LruHardMemoryMb = val.parseAs<size_t>(); }
+  void setS3LruStaleTimeoutSec(kj::StringPtr val) { s3LruStaleTimeoutSec = val.parseAs<uint64_t>(); }
+
+  void setCpuLimitMs(kj::StringPtr val) { cpuLimitMs = val.parseAs<uint64_t>(); }
+  void setWallLimitSec(kj::StringPtr val) { wallLimitSec = val.parseAs<uint64_t>(); }
+  void setHeapLimitMb(kj::StringPtr val) { heapLimitMb = val.parseAs<size_t>(); }
+
   kj::MainFunc addServeOptions(kj::MainBuilder& builder) {
     return addServeOrTestOptions(builder)
         .addOptionWithArg({'l', "listen"}, CLI_METHOD(addListenAddress), "<addr>",
@@ -929,6 +945,34 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             "Run N worker cores with a PROXY v2 dispatcher. Each core gets its own "
             "event loop and V8 isolates. On Linux, cores are pinned to CPUs. Default: 1.")
 #endif
+        .addOption({"s3"}, [this]() { s3Enabled = true; return true; },
+            "Enable S3-based dynamic worker resolution.")
+        .addOptionWithArg({"s3-endpoint"}, CLI_METHOD(setS3Endpoint), "<url>",
+            "S3-compatible endpoint URL.")
+        .addOptionWithArg({"s3-access-key-file"}, CLI_METHOD(setS3AccessKeyFile), "<path>",
+            "File containing AWS access key.")
+        .addOptionWithArg({"s3-secret-key-file"}, CLI_METHOD(setS3SecretKeyFile), "<path>",
+            "File containing AWS secret key.")
+        .addOptionWithArg({"s3-bucket"}, CLI_METHOD(setS3Bucket), "<name>",
+            "S3 bucket name.")
+        .addOptionWithArg({"s3-cache-dir"}, CLI_METHOD(setS3CacheDir), "<path>",
+            "Local disk cache directory for fetched modules.")
+        .addOptionWithArg({"s3-compat-date"}, CLI_METHOD(setS3CompatDate), "<date>",
+            "Compatibility date for S3 workers (default: 2026-01-31).")
+        .addOptionWithArg({"s3-lru-max-workers"}, CLI_METHOD(setS3LruMaxWorkers), "<N>",
+            "Maximum number of cached S3 workers per thread (default: 200).")
+        .addOptionWithArg({"s3-lru-soft-memory-mb"}, CLI_METHOD(setS3LruSoftMemoryMb), "<MB>",
+            "Start evicting idle workers when process RSS exceeds this (MB, default: 1024).")
+        .addOptionWithArg({"s3-lru-hard-memory-mb"}, CLI_METHOD(setS3LruHardMemoryMb), "<MB>",
+            "Reject new worker loads when process RSS exceeds this (MB, default: 2048).")
+        .addOptionWithArg({"s3-lru-stale-timeout-sec"}, CLI_METHOD(setS3LruStaleTimeoutSec), "<sec>",
+            "Evict idle workers after this many seconds (default: 900).")
+        .addOptionWithArg({"cpu-limit-ms"}, CLI_METHOD(setCpuLimitMs), "<ms>",
+            "Per-request CPU time limit in milliseconds (0 = no limit).")
+        .addOptionWithArg({"wall-limit-sec"}, CLI_METHOD(setWallLimitSec), "<sec>",
+            "Per-request wall clock time limit in seconds (0 = no limit).")
+        .addOptionWithArg({"heap-limit-mb"}, CLI_METHOD(setHeapLimitMb), "<MB>",
+            "Per-isolate V8 heap size limit in megabytes (0 = V8 default).")
         .callAfterParsing(CLI_METHOD(serve))
         .build();
   }
@@ -1510,6 +1554,67 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     KJ_REQUIRE(listenAddresses.size() > 0 || hasConfigSockets,
         "At least one --listen address or config socket is required.");
 
+    // Forward resource limits to the primary server (used by thread servers in multi-core mode,
+    // and directly in test mode).
+    {
+      Server::ResourceLimitOptions resLimits;
+      resLimits.cpuLimit = cpuLimitMs * kj::MILLISECONDS;
+      resLimits.wallLimit = wallLimitSec * kj::SECONDS;
+      resLimits.heapLimitMb = heapLimitMb;
+      server->setResourceLimits(kj::mv(resLimits));
+    }
+
+    // Construct S3WorkerFetcher if --s3 is enabled.
+    if (s3Enabled) {
+      auto readFileContent = [](kj::StringPtr path) -> kj::String {
+        auto file = kj::newDiskFilesystem()->getRoot()
+            .openFile(kj::Path::parse(path.slice(path.startsWith("/") ? 1 : 0)));
+        auto content = file->readAllText();
+        // Trim trailing whitespace/newlines.
+        while (content.size() > 0 && (content[content.size() - 1] == '\n' ||
+               content[content.size() - 1] == '\r' ||
+               content[content.size() - 1] == ' ')) {
+          content = kj::str(content.first(content.size() - 1));
+        }
+        return content;
+      };
+
+      auto endpoint = KJ_ASSERT_NONNULL(kj::mv(s3Endpoint),
+          "--s3-endpoint is required when --s3 is enabled");
+      auto accessKeyFile = KJ_ASSERT_NONNULL(kj::mv(s3AccessKeyFile),
+          "--s3-access-key-file is required when --s3 is enabled");
+      auto secretKeyFile = KJ_ASSERT_NONNULL(kj::mv(s3SecretKeyFile),
+          "--s3-secret-key-file is required when --s3 is enabled");
+      auto bucket = KJ_ASSERT_NONNULL(kj::mv(s3Bucket),
+          "--s3-bucket is required when --s3 is enabled");
+      auto cacheDir = KJ_ASSERT_NONNULL(kj::mv(s3CacheDir),
+          "--s3-cache-dir is required when --s3 is enabled");
+
+      auto accessKey = readFileContent(accessKeyFile);
+      auto secretKey = readFileContent(secretKeyFile);
+      auto compatDate = s3CompatDate.map([](auto& d) { return kj::str(d); })
+          .orDefault(kj::str("2026-01-31"));
+
+      s3Fetcher = kj::heap<S3WorkerFetcher>(S3Config{
+        .endpoint = kj::mv(endpoint),
+        .accessKey = kj::mv(accessKey),
+        .secretKey = kj::mv(secretKey),
+        .bucket = kj::mv(bucket),
+        .cacheDir = kj::mv(cacheDir),
+        .compatDate = kj::mv(compatDate),
+      });
+
+      KJ_LOG(INFO, "S3 dynamic worker resolution enabled");
+
+      // Configure S3 LRU eviction options.
+      S3WorkerLruOptions lruOptions;
+      KJ_IF_SOME(val, s3LruMaxWorkers) { lruOptions.maxWorkers = val; }
+      KJ_IF_SOME(val, s3LruSoftMemoryMb) { lruOptions.softMemoryLimit = val * 1024 * 1024; }
+      KJ_IF_SOME(val, s3LruHardMemoryMb) { lruOptions.hardMemoryLimit = val * 1024 * 1024; }
+      KJ_IF_SOME(val, s3LruStaleTimeoutSec) { lruOptions.staleTimeout = val * kj::SECONDS; }
+      s3LruOptionsForThreads = lruOptions;
+    }
+
     // Build serviceToCore map: round-robin assign worker services to cores.
     kj::HashMap<kj::String, uint> serviceToCore;
     uint nextCore = 0;
@@ -1668,6 +1773,24 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         // Forward settings to thread servers.
         if (experimentalEnabled) {
           threadServer->allowExperimental();
+        }
+
+        // Forward S3 fetcher and LRU options to thread servers.
+        KJ_IF_SOME(fetcher, s3Fetcher) {
+          threadServer->setS3Fetcher(*fetcher);
+          threadServer->setS3CompatDate(fetcher->getConfig().compatDate);
+          KJ_IF_SOME(lruOpts, s3LruOptionsForThreads) {
+            threadServer->setS3LruOptions(lruOpts);
+          }
+        }
+
+        // Forward resource limits to thread servers.
+        {
+          Server::ResourceLimitOptions resLimits;
+          resLimits.cpuLimit = cpuLimitMs * kj::MILLISECONDS;
+          resLimits.wallLimit = wallLimitSec * kj::SECONDS;
+          resLimits.heapLimitMb = heapLimitMb;
+          threadServer->setResourceLimits(kj::mv(resLimits));
         }
 
         // Forward inspector and control-fd to thread 0 only.
@@ -1940,6 +2063,25 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   kj::Maybe<kj::String> perfettoTraceDestination;
   kj::Maybe<kj::String> perfettoTraceCategories;
 #endif
+
+  // S3 dynamic worker resolution.
+  bool s3Enabled = false;
+  kj::Maybe<kj::String> s3Endpoint;
+  kj::Maybe<kj::String> s3AccessKeyFile;
+  kj::Maybe<kj::String> s3SecretKeyFile;
+  kj::Maybe<kj::String> s3Bucket;
+  kj::Maybe<kj::String> s3CacheDir;
+  kj::Maybe<kj::String> s3CompatDate;
+  kj::Maybe<kj::Own<S3WorkerFetcher>> s3Fetcher;
+  kj::Maybe<size_t> s3LruMaxWorkers;
+  kj::Maybe<size_t> s3LruSoftMemoryMb;
+  kj::Maybe<size_t> s3LruHardMemoryMb;
+  kj::Maybe<uint64_t> s3LruStaleTimeoutSec;
+  kj::Maybe<S3WorkerLruOptions> s3LruOptionsForThreads;
+
+  uint64_t cpuLimitMs = 0;
+  uint64_t wallLimitSec = 0;
+  size_t heapLimitMb = 0;
 
   kj::Own<Server> server;
 

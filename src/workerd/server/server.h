@@ -10,6 +10,8 @@
 #include <workerd/api/pyodide/pyodide.h>
 #include <workerd/io/worker.h>
 #include <workerd/server/alarm-scheduler.h>
+#include <workerd/server/s3-worker-fetcher.h>
+#include <workerd/server/s3-worker-lru.h>
 #include <workerd/server/workerd.capnp.h>
 
 #include <kj/async-io.h>
@@ -95,6 +97,18 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
     pythonConfig.snapshotDirectory = kj::mv(dir);
   }
 
+  void setS3Fetcher(S3WorkerFetcher& fetcher) { s3Fetcher = fetcher; }
+  void setS3CompatDate(kj::StringPtr date) { s3CompatDate = date; }
+  void setS3LruOptions(S3WorkerLruOptions options) { s3LruOptions = kj::mv(options); }
+
+  struct ResourceLimitOptions {
+    kj::Duration cpuLimit = 0 * kj::NANOSECONDS;   // 0 = no limit
+    kj::Duration wallLimit = 0 * kj::NANOSECONDS;   // 0 = no limit
+    size_t heapLimitMb = 0;                          // 0 = V8 default
+  };
+
+  void setResourceLimits(ResourceLimitOptions opts) { resourceLimits = kj::mv(opts); }
+
   // Set the compatibility date to use for all workers. When set, workers in the config must NOT
   // specify compatibilityDate (an error is reported if they do). This is used for testing to
   // ensure tests run with both old and new compat dates.
@@ -152,6 +166,13 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
     .loadSnapshotFromDisk = kj::none};
 
   bool experimental = false;
+
+  kj::Maybe<S3WorkerFetcher&> s3Fetcher;
+  kj::StringPtr s3CompatDate;
+  kj::Maybe<S3WorkerLruOptions> s3LruOptions;
+  kj::Maybe<kj::Own<S3WorkerLru>> s3Lru;
+
+  ResourceLimitOptions resourceLimits;
 
   // When set, overrides compatibilityDate for all workers and enforces that workers don't
   // specify their own compatibilityDate.
@@ -318,6 +339,9 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
       capnp::List<config::Extension>::Reader extensions,
       ErrorReporter& errorReporter);
 
+  kj::Promise<kj::Own<Service>> createS3WorkerService(
+      kj::StringPtr workerId, FetchedWorkerModules modules);
+
   kj::Promise<void> startServices(jsg::V8System& v8System,
       config::Config::Reader config,
       kj::HttpHeaderTable::Builder& headerTableBuilder,
@@ -336,6 +360,10 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   kj::Promise<void> preloadPython(
       kj::StringPtr workerName, const WorkerDef& workerDef, ErrorReporter& errorReporter);
 
+  // Called by S3WorkerLru to evict a dynamically loaded worker service.
+  void evictS3WorkerService(kj::StringPtr workerId);
+
+  friend class S3WorkerLru;
   friend struct FutureSubrequestChannel;
   friend struct FutureActorClassChannel;
 };

@@ -54,6 +54,7 @@
 
 #include <cstdlib>
 #include <ctime>
+#include <time.h>  // clock_gettime, CLOCK_THREAD_CPUTIME_ID
 
 namespace workerd::server {
 
@@ -1730,11 +1731,24 @@ class SequentialSpanSubmitter final: public SpanSubmitter {
 // IsolateLimitEnforcer that enforces no limits.
 class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
+  explicit NullIsolateLimitEnforcer(size_t heapLimitMb = 0) : heapLimitMb(heapLimitMb) {}
+
   v8::Isolate::CreateParams getCreateParams() override {
-    return {};
+    v8::Isolate::CreateParams params;
+    if (heapLimitMb > 0) {
+      params.constraints.ConfigureDefaultsFromHeapSize(0, heapLimitMb * 1024 * 1024);
+    }
+    return params;
   }
 
-  void customizeIsolate(v8::Isolate* isolate) override {}
+  void customizeIsolate(v8::Isolate* isolate) override {
+    if (heapLimitMb > 0) {
+      isolate->AddNearHeapLimitCallback(
+          [](void*, size_t currentHeapLimit, size_t) -> size_t {
+            return currentHeapLimit;  // don't grow — let V8 OOM
+          }, nullptr);
+    }
+  }
 
   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
     // TODO(someday): Make this configurable?
@@ -1796,6 +1810,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   }
 
  private:
+  size_t heapLimitMb;
   TrackedWasmInstanceList trackedWasmInstances;
 };
 
@@ -1920,6 +1935,11 @@ class Server::WorkerService final: public Service,
         dockerPath(kj::mv(dockerPathParam)),
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic) {}
+
+  void setResourceLimits(kj::Duration cpu, kj::Duration wall) {
+    cpuLimit = cpu;
+    wallLimit = wall;
+  }
 
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
   // the constructor itself since it sets up cyclic references, which will throw an exception if
@@ -2092,6 +2112,11 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none,
       bool isTracer = false) {
     TRACE_EVENT("workerd", "Server::WorkerService::startRequest()");
+
+    // Reset per-request limit tracking state.
+    cpuTimeAccumulated = 0 * kj::NANOSECONDS;
+    limitsExceededFulfiller = kj::none;
+    exceededOutcome = kj::none;
 
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
@@ -3226,6 +3251,15 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::String> containerEgressInterceptorImage;
   bool isDynamic;
 
+  // Per-request resource limits (0 = no limit).
+  kj::Duration cpuLimit = 0 * kj::NANOSECONDS;
+  kj::Duration wallLimit = 0 * kj::NANOSECONDS;
+
+  // Per-request mutable state for CPU tracking, reset in startRequest().
+  kj::Duration cpuTimeAccumulated = 0 * kj::NANOSECONDS;
+  kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> limitsExceededFulfiller;
+  kj::Maybe<EventOutcome> exceededOutcome;
+
   class ActorChannelImpl final: public IoChannelFactory::ActorChannel {
    public:
     ActorChannelImpl(kj::Own<ActorNamespace::ActorContainer> actorContainer)
@@ -3488,12 +3522,40 @@ class Server::WorkerService final: public Service,
 
   // ---------------------------------------------------------------------------
   // implements LimitEnforcer
-  //
-  // No limits are enforced.
 
   kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
-    return {};
+    if (cpuLimit == 0 * kj::NANOSECONDS) return {};
+
+    // Capture the current thread's CPU time at entry. clock_gettime(CLOCK_THREAD_CPUTIME_ID)
+    // measures CPU time consumed by THIS thread, which is the isolate's thread.
+    struct timespec startTs;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &startTs);
+
+    class CpuTimeGuard final {
+    public:
+      CpuTimeGuard(WorkerService& svc, struct timespec start) : svc(svc), startTs(start) {}
+      ~CpuTimeGuard() noexcept(false) {
+        struct timespec endTs;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endTs);
+        int64_t ns = (endTs.tv_sec - startTs.tv_sec) * 1'000'000'000LL
+                   + (endTs.tv_nsec - startTs.tv_nsec);
+        svc.cpuTimeAccumulated = svc.cpuTimeAccumulated + ns * kj::NANOSECONDS;
+
+        if (svc.cpuTimeAccumulated >= svc.cpuLimit) {
+          svc.exceededOutcome = EventOutcome::EXCEEDED_CPU;
+          KJ_IF_SOME(f, svc.limitsExceededFulfiller) {
+            f->reject(KJ_EXCEPTION(OVERLOADED, "Worker CPU time limit exceeded"));
+          }
+        }
+      }
+    private:
+      WorkerService& svc;
+      struct timespec startTs;
+    };
+
+    return kj::heap<CpuTimeGuard>(*this, startTs);
   }
+
   void topUpActor() override {}
   void newSubrequest(bool isInHouse) override {}
   void newKvRequest(KvOpType op) override {}
@@ -3510,14 +3572,52 @@ class Server::WorkerService final: public Service,
   size_t getBufferingLimit() override {
     return kj::maxValue;
   }
+
   kj::Maybe<EventOutcome> getLimitsExceeded() override {
-    return kj::none;
+    return exceededOutcome;
   }
+
   kj::Promise<void> onLimitsExceeded() override {
+    kj::Maybe<kj::Promise<void>> wallPromise;
+    kj::Maybe<kj::Promise<void>> cpuPromise;
+
+    if (wallLimit > 0 * kj::NANOSECONDS) {
+      wallPromise = threadContext.getUnsafeTimer().afterDelay(wallLimit).then([this]() {
+        exceededOutcome = EventOutcome::EXCEEDED_CPU;  // reuse exceededCpu; log message clarifies
+        kj::throwFatalException(
+            KJ_EXCEPTION(OVERLOADED, "Worker wall clock time limit exceeded"));
+      });
+    }
+
+    if (cpuLimit > 0 * kj::NANOSECONDS) {
+      auto paf = kj::newPromiseAndFulfiller<void>();
+      limitsExceededFulfiller = kj::mv(paf.fulfiller);
+      cpuPromise = kj::mv(paf.promise);
+    }
+
+    // Race: first to reject aborts the request.
+    KJ_IF_SOME(w, wallPromise) {
+      KJ_IF_SOME(c, cpuPromise) {
+        return kj::mv(w).exclusiveJoin(kj::mv(c));
+      }
+      return kj::mv(w);
+    }
+    KJ_IF_SOME(c, cpuPromise) {
+      return kj::mv(c);
+    }
     return kj::NEVER_DONE;
   }
+
   void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) override {}
-  void requireLimitsNotExceeded() override {}
+
+  void requireLimitsNotExceeded() override {
+    KJ_IF_SOME(outcome, exceededOutcome) {
+      if (outcome == EventOutcome::EXCEEDED_CPU) {
+        KJ_FAIL_REQUIRE("Worker resource limit exceeded");
+      }
+    }
+  }
+
   void reportMetrics(RequestObserver& requestMetrics) override {}
   kj::Duration consumeTimeElapsedForPeriodicLogging() override {
     return 0 * kj::SECONDS;
@@ -4440,7 +4540,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
   auto observer = kj::atomicRefcounted<IsolateObserver>();
-  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>(resourceLimits.heapLimitMb);
 
   // Create the FsMap that will be used to map known file system
   // roots to configurable locations.
@@ -4840,7 +4940,128 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors), kj::mv(dockerPath),
           kj::mv(containerEgressInterceptorImage), def.isDynamic);
   result->initActorNamespaces(def.localActorConfigs, network);
+  result->setResourceLimits(resourceLimits.cpuLimit, resourceLimits.wallLimit);
   co_return result;
+}
+
+class S3NullOutbound: public IoChannelFactory::SubrequestChannel {
+public:
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    JSG_FAIL_REQUIRE(Error,
+        "S3-loaded workers are not permitted to access the internet via global functions "
+        "like fetch(). Configure appropriate bindings to enable outbound requests.");
+  }
+  void requireAllowsTransfer() override {
+    JSG_FAIL_REQUIRE(TypeError, "Cannot transfer the null outbound channel.");
+  }
+};
+
+void Server::evictS3WorkerService(kj::StringPtr workerId) {
+  KJ_IF_SOME(service, services.find(workerId)) {
+    service->unlink();
+  }
+  services.erase(workerId);
+}
+
+kj::Promise<kj::Own<Server::Service>> Server::createS3WorkerService(
+    kj::StringPtr workerId, FetchedWorkerModules modules) {
+  static const kj::HashMap<kj::String, ActorConfig> EMPTY_ACTOR_CONFIGS;
+
+  // We need to own all the data that WorkerSource will reference via StringPtr/ArrayPtr.
+  // Pack everything into a heap-allocated struct and pass it via maybeOwnedSourceCode.
+  struct OwnedS3Source {
+    FetchedWorkerModules modules;
+    kj::String mainModuleName;
+    kj::String esmWrapperName;     // for CJS: ESM wrapper module name
+    kj::String esmWrapperBody;     // for CJS: ESM wrapper source
+    capnp::MallocMessageBuilder arena;
+    kj::Array<kj::String> compatFlags;
+  };
+  auto owned = kj::heap<OwnedS3Source>();
+  owned->modules = kj::mv(modules);
+  owned->mainModuleName = kj::str(owned->modules.mainModuleName);
+  auto compatFlagsBuilder = kj::heapArrayBuilder<kj::String>(1);
+  compatFlagsBuilder.add(kj::str("nodejs_compat"));
+  owned->compatFlags = compatFlagsBuilder.finish();
+
+  // Build compat flags.
+  auto featureFlags = owned->arena.initRoot<CompatibilityFlags>();
+  DynamicErrorReporter errorReporter;
+  compileCompatibilityFlags(s3CompatDate, owned->compatFlags.asPtr(), featureFlags,
+      errorReporter, true, CompatibilityDateValidation::CODE_VERSION);
+
+  // Build module list. All StringPtr/ArrayPtr point into owned->modules data.
+  kj::Vector<WorkerSource::Module> moduleList;
+
+  if (owned->modules.isCjs) {
+    // CJS can't be the main module. Create an ESM wrapper that re-exports it.
+    owned->esmWrapperName = kj::str("worker.js");
+    owned->esmWrapperBody = kj::str(
+        "import worker from \"./", owned->mainModuleName, "\";\nexport default worker;\n");
+
+    // Register the ESM wrapper as the main module.
+    moduleList.add(WorkerSource::Module{
+      .name = owned->esmWrapperName,
+      .content = WorkerSource::EsModule{.body = kj::ArrayPtr<const char>(
+          owned->esmWrapperBody.begin(), owned->esmWrapperBody.size())},
+    });
+
+    // Register the CJS module with its original name (owned->mainModuleName).
+    moduleList.add(WorkerSource::Module{
+      .name = owned->mainModuleName,
+      .content = WorkerSource::CommonJsModule{.body = kj::StringPtr(
+          reinterpret_cast<const char*>(owned->modules.mainModule.begin()),
+          owned->modules.mainModule.size())},
+    });
+  } else {
+    moduleList.add(WorkerSource::Module{
+      .name = owned->mainModuleName,
+      .content = WorkerSource::EsModule{.body = kj::ArrayPtr<const char>(
+          reinterpret_cast<const char*>(owned->modules.mainModule.begin()),
+          owned->modules.mainModule.size())},
+    });
+  }
+
+  for (auto& wasm : owned->modules.wasmModules) {
+    moduleList.add(WorkerSource::Module{
+      .name = wasm.name,
+      .content = WorkerSource::WasmModule{.body = wasm.data},
+    });
+  }
+
+  WorkerSource source(WorkerSource::ModulesSource{
+    .mainModule = owned->modules.isCjs ? owned->esmWrapperName : owned->mainModuleName,
+    .modules = moduleList.releaseAsArray(),
+    .capnpSchemas = {},
+    .isPython = false,
+    .pythonMemorySnapshot = kj::none,
+  });
+
+  WorkerDef def{
+    .featureFlags = featureFlags.asReader(),
+    .source = kj::mv(source),
+    .moduleFallback = kj::none,
+    .localActorConfigs = EMPTY_ACTOR_CONFIGS,
+    .isDynamic = true,
+
+    .globalOutbound{
+      .designator = kj::Own<IoChannelFactory::SubrequestChannel>(kj::refcounted<S3NullOutbound>()),
+      .errorContext = kj::str("S3 Worker \"", workerId, "\"'s globalOutbound"),
+    },
+
+    .compileBindings = [](jsg::Lock& lock, const Worker::Api& api,
+                           v8::Local<v8::Object> target) {},
+
+    .maybeOwnedSourceCode = kj::Own<void>(kj::mv(owned)),
+  };
+
+  auto service = co_await makeWorkerImpl(workerId, kj::mv(def), {}, errorReporter);
+  errorReporter.throwIfErrors();
+
+  service->link(errorReporter);
+  errorReporter.throwIfErrors();
+
+  co_return kj::mv(service);
 }
 
 // =======================================================================================
@@ -5554,6 +5775,20 @@ kj::Promise<void> Server::run(
 
   co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
 
+  // Initialize S3 LRU if S3 is configured with LRU options.
+  KJ_IF_SOME(options, s3LruOptions) {
+    s3Lru = kj::heap<S3WorkerLru>(*this, monotonicClock, options);
+
+    // Start periodic stale eviction timer.
+    tasks.add(([this]() -> kj::Promise<void> {
+      auto& lru = KJ_ASSERT_NONNULL(s3Lru);
+      for (;;) {
+        co_await timer.afterDelay(lru->options.evictionInterval);
+        lru->evictStale();
+      }
+    })());
+  }
+
   auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen);
 
   // We should have registered all headers synchronously. This is important because we want to
@@ -5806,21 +6041,90 @@ class Server::ProxyRoutingListener final: public kj::Refcounted {
 
       KJ_IF_SOME(workerId, result.workerId) {
         // If this listener has an allowed-services set, check it.
+        // When S3 is enabled, skip this check for worker IDs that look like S3 paths
+        // (contain slashes), allowing dynamic resolution.
         if (allowedServices.size() > 0 && !allowedServices.contains(workerId)) {
-          KJ_LOG(WARNING, "Worker ID not in socket's allowed services", workerId);
-          continue;
+          if (owner.s3Fetcher == kj::none ||
+              workerId.findFirst('/') == kj::none) {
+            KJ_LOG(WARNING, "Worker ID not in socket's allowed services", workerId);
+            continue;
+          }
         }
 
-        // Look up service by worker ID.
-        auto& serviceRef = KJ_UNWRAP_OR(owner.services.find(workerId), {
-          KJ_LOG(WARNING, "Unknown worker ID in PROXY v2 header", workerId);
-          continue;
-        });
+        // Look up service by worker ID, falling back to S3 dynamic resolution.
+        auto servicePtr = owner.services.find(workerId);
+        bool isS3Worker = false;
 
+        if (servicePtr == kj::none) {
+          KJ_IF_SOME(fetcher, owner.s3Fetcher) {
+            // Check LRU capacity before loading
+            KJ_IF_SOME(lru, owner.s3Lru) {
+              if (!lru->evictIfNeeded()) {
+                KJ_LOG(WARNING, "S3 LRU at capacity, rejecting connection", workerId);
+                continue;
+              }
+              lru->markCreating(workerId);
+            }
+
+            auto maybeModules = fetcher.fetchWorker(workerId);
+            KJ_IF_SOME(modules, maybeModules) {
+              try {
+                auto s3Service = co_await owner.createS3WorkerService(workerId, kj::mv(modules));
+                owner.services.upsert(kj::str(workerId), kj::mv(s3Service), [](auto&, auto&&) {});
+                servicePtr = owner.services.find(workerId);
+                isS3Worker = true;
+
+                KJ_IF_SOME(lru, owner.s3Lru) {
+                  lru->markCreated(workerId);
+                }
+              } catch (kj::Exception& e) {
+                KJ_LOG(ERROR, "Failed to create S3 worker service", workerId, e);
+                KJ_IF_SOME(lru, owner.s3Lru) {
+                  lru->removeCreating(workerId);
+                }
+                continue;
+              }
+            } else {
+              KJ_LOG(WARNING, "Worker not found in S3 or disk cache", workerId);
+              KJ_IF_SOME(lru, owner.s3Lru) {
+                lru->removeCreating(workerId);
+              }
+              continue;
+            }
+          } else {
+            KJ_LOG(WARNING, "Unknown worker ID in PROXY v2 header", workerId);
+            continue;
+          }
+        } else {
+          // Existing service -- check if it's an S3 worker and touch LRU
+          KJ_IF_SOME(lru, owner.s3Lru) {
+            if (lru->contains(workerId)) {
+              lru->touch(workerId);
+              isS3Worker = true;
+            }
+          }
+        }
+
+        auto& serviceRef = KJ_ASSERT_NONNULL(servicePtr);
+
+        // For S3 workers, use RAII request tracking via custom disposer.
+        // For config-defined services, use NullDisposer as before.
+        kj::Maybe<kj::Own<S3RequestGuard>> maybeBorrower;
+        if (isS3Worker) {
+          KJ_IF_SOME(lru, owner.s3Lru) {
+            maybeBorrower = lru->acquireRequest(workerId);
+          }
+        }
         kj::Own<Service> service(serviceRef.get(), kj::NullDisposer::instance);
 
-        // Spawn connection handler as a task.
-        owner.tasks.add(handleConnection(kj::addRef(*this), kj::mv(stream), kj::mv(service)));
+        // Spawn connection handler as a task. Attach the borrower so it lives
+        // until the connection handler completes (releasing the active request count).
+        KJ_IF_SOME(borrower, maybeBorrower) {
+          owner.tasks.add(handleConnection(
+              kj::addRef(*this), kj::mv(stream), kj::mv(service)).attach(kj::mv(borrower)));
+        } else {
+          owner.tasks.add(handleConnection(kj::addRef(*this), kj::mv(stream), kj::mv(service)));
+        }
       } else {
         continue;  // no worker ID → close
       }

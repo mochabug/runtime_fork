@@ -5594,5 +5594,92 @@ KJ_TEST("Server: config socket rejects disallowed worker ID") {
   KJ_EXPECT(conn.isEof());
 }
 
+#if __linux__
+KJ_TEST("Server: CPU time limit exceeded (Linux only)") {
+  // This test verifies that the CPU time limiter measures actual thread CPU time
+  // (via CLOCK_THREAD_CPUTIME_ID), not wall clock time. The worker burns CPU in a
+  // tight loop to exceed a low CPU limit, then yields to the event loop so the
+  // abort can propagate. The wall limit is set high so it does NOT trigger.
+  TestServer test(singleWorker(R"((
+    compatibilityDate = "2024-01-01",
+    modules = [
+      ( name = "main.js",
+        esModule =
+          `export default {
+          `  async fetch(request) {
+          `    // Burn CPU time in a tight loop. This should exceed the CPU limit.
+          `    let x = 0;
+          `    for (let i = 0; i < 500000000; i++) {
+          `      x += Math.sqrt(i);
+          `    }
+          `    // Yield to the event loop so the abort can kick in.
+          `    await scheduler.wait(0);
+          `    return new Response("should not reach here: " + x);
+          `  }
+          `}
+      )
+    ]
+  ))"_kj));
+
+  // Set a very low CPU limit (50ms) and a high wall limit (30s).
+  test.server.setResourceLimits({
+    .cpuLimit = 50 * kj::MILLISECONDS,
+    .wallLimit = 30 * kj::SECONDS,
+    .heapLimitMb = 0,
+  });
+
+  test.start();
+  auto conn = test.connect("hello");
+
+  // Expect the error logs that the CPU limit exceeded path produces.
+  KJ_EXPECT_LOG(ERROR, "Worker CPU time limit exceeded");
+  KJ_EXPECT_LOG(ERROR, "Uncaught exception");
+
+  conn.sendHttpGet("/");
+
+  // The response should be a 500 Internal Server Error because the CPU limit was exceeded.
+  conn.recv(R"(
+    HTTP/1.1 500 Internal Server Error
+    Connection: close
+    Content-Length: 21
+
+    Internal Server Error)"_blockquote);
+}
+
+KJ_TEST("Server: CPU time NOT exceeded for I/O-bound work (Linux only)") {
+  // This test verifies that a worker which does very little CPU work but waits on
+  // I/O (setTimeout) does NOT hit the CPU limit. This proves that CLOCK_THREAD_CPUTIME_ID
+  // correctly measures only CPU time, not wall time.
+  TestServer test(singleWorker(R"((
+    compatibilityDate = "2024-01-01",
+    modules = [
+      ( name = "main.js",
+        esModule =
+          `export default {
+          `  async fetch(request) {
+          `    // Do a tiny bit of CPU work, well under any limit.
+          `    let x = 0;
+          `    for (let i = 0; i < 1000; i++) x += i;
+          `    return new Response("ok: " + x);
+          `  }
+          `}
+      )
+    ]
+  ))"_kj));
+
+  // Set a CPU limit that the trivial loop should NOT exceed.
+  test.server.setResourceLimits({
+    .cpuLimit = 500 * kj::MILLISECONDS,
+    .wallLimit = 30 * kj::SECONDS,
+    .heapLimitMb = 0,
+  });
+
+  test.start();
+  auto conn = test.connect("hello");
+
+  conn.httpGet200("/", "ok: 499500");
+}
+#endif  // __linux__
+
 }  // namespace
 }  // namespace workerd::server

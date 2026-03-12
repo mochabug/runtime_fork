@@ -26,6 +26,9 @@ MODULE.bazel.lock
 
 /.bazel-cache
 
+/linux-build-output
+/Dockerfile.linux-test
+
 /workerd-*
 
 /docs/api
